@@ -37,6 +37,7 @@ if sys.version_info >= (3, 9):
 else:
     from typing_extensions import Annotated, Literal
 
+
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import CustomMaterializationProperties
 
@@ -514,7 +515,7 @@ class IncrementalByPartitionKind(_Incremental):
         ]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -708,7 +709,7 @@ class _SCDType2Kind(_Incremental):
     @field_validator("time_data_type", mode="before", always=True)
     @classmethod
     def _time_data_type_validator(
-            cls, v: t.Union[str, exp.Expression], values: t.Any
+        cls, v: t.Union[str, exp.Expression], values: t.Any
     ) -> exp.Expression:
         if isinstance(v, exp.Expression) and not isinstance(v, exp.DataType):
             v = v.name
