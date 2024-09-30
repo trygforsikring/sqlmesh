@@ -1,3 +1,82 @@
+## Installation
+
+This page provides instructions for installing SQLMesh on your computer.
+
+### Python virtual environment
+
+It is recommended, but not required, that you use a python virtual environment with SQLMesh.
+
+First, create the virtual environment:
+```bash
+python -m venv .env
+```
+
+Then activate it:
+```bash
+source .env/bin/activate
+```
+
+## Install SQLMesh core
+
+Install the core SQLMesh library with `pip`:
+```bash
+pip install psycopg2-binary
+pip install sqlmesh
+```
+
+## Getting Started
+Once you have installed the sqlmesh in the local machine then you can create your first project by folowing:
+
+```bash
+mkdir sqlmesh-example
+cd sqlmesh-example
+{path_to_your_sqlmesh-project}/.env/bin/activate
+sqlmesh init risingwave # get started right away with a risingwave instance
+```
+
+Once you have the done this you will see couple of folder inside your project directory. You can remove all sql files under model folder as it is for demo purpose. Also it is safe to remove test and seeds folders as well for now.
+
+And in the config.yaml file you need to supply everything that need for the connections to the risingwave instance. Below is an example. For now lets keep the local duckdb instance as the state_connection.
+
+```yaml
+gateways:
+  local:
+    connection:
+      type: risingwave
+      host: hostname
+      port: 4567
+      user: root
+      database: dev
+      password: root
+    state_connection:
+      type: duckdb
+      database: duckdb.db
+
+```
+
+Now you can start using it by creating a new sql file under model or a file under macros.
+
+An example,
+
+```sql
+MODEL (
+  name schema_name.model_name,
+  kind VIEW (
+    materialized true
+    ),
+);
+SELECT
+  id,
+  name,
+  age,
+FROM your_source_or_table
+```
+
+Follow the [quickstart guide](https://sqlmesh.readthedocs.io/en/stable/quickstart/cli/#1-create-the-sqlmesh-project) to learn how to use SQLMesh. You already have a head start!
+
+
+
+
 <p align="center">
   <img src="https://github.com/TobikoData/sqlmesh/blob/main/docs/readme/sqlmesh.png?raw=true" alt="SQLMesh logo" width="50%" height="50%">
 </p>
