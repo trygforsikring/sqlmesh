@@ -68,11 +68,11 @@ class ModelKindMixin:
     @property
     def is_incremental(self) -> bool:
         return (
-                self.is_incremental_by_time_range
-                or self.is_incremental_by_unique_key
-                or self.is_incremental_by_partition
-                or self.is_incremental_unmanaged
-                or self.is_scd_type_2
+            self.is_incremental_by_time_range
+            or self.is_incremental_by_unique_key
+            or self.is_incremental_by_partition
+            or self.is_incremental_unmanaged
+            or self.is_scd_type_2
         )
 
     @property
@@ -201,7 +201,7 @@ class OnDestructiveChange(str, Enum):
 
 
 def _on_destructive_change_validator(
-        cls: t.Type, v: t.Union[OnDestructiveChange, str, exp.Identifier]
+    cls: t.Type, v: t.Union[OnDestructiveChange, str, exp.Identifier]
 ) -> t.Any:
     if v and not isinstance(v, OnDestructiveChange):
         return OnDestructiveChange(
@@ -223,7 +223,7 @@ class _ModelKind(PydanticModel, ModelKindMixin):
         return self.name
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         kwargs["expressions"] = expressions
         return d.ModelKind(this=self.name.value.upper(), **kwargs)
@@ -343,7 +343,7 @@ class _Incremental(_ModelKind):
         ]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -383,7 +383,7 @@ class _IncrementalBy(_Incremental):
         ]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -408,7 +408,7 @@ class IncrementalByTimeRangeKind(_IncrementalBy):
     _time_column_validator = TimeColumn.validator()
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -431,9 +431,9 @@ class IncrementalByUniqueKeyKind(_IncrementalBy):
     @field_validator("when_matched", mode="before")
     @field_validator_v1_args
     def _when_matched_validator(
-            cls,
-            v: t.Optional[t.Union[exp.When, str, t.List[exp.When], t.List[str]]],
-            values: t.Dict[str, t.Any],
+        cls,
+        v: t.Optional[t.Union[exp.When, str, t.List[exp.When], t.List[str]]],
+        values: t.Dict[str, t.Any],
     ) -> t.Optional[t.List[exp.When]]:
         def replace_table_references(expression: exp.Expression) -> exp.Expression:
             from sqlmesh.core.engine_adapter.base import (
@@ -477,7 +477,7 @@ class IncrementalByUniqueKeyKind(_IncrementalBy):
         ]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -548,7 +548,7 @@ class IncrementalUnmanagedKind(_Incremental):
         ]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -620,7 +620,7 @@ class ViewKind(_ModelKind):
         return False
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -655,7 +655,7 @@ class SeedKind(_ModelKind):
         return v
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         """Convert the seed kind into a SQLGlot expression."""
         return super().to_expression(
@@ -745,7 +745,7 @@ class _SCDType2Kind(_Incremental):
         ]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -786,7 +786,7 @@ class SCDType2ByTimeKind(_SCDType2Kind):
         ]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -816,7 +816,7 @@ class SCDType2ByColumnKind(_SCDType2Kind):
         return [*super().data_hash_values, *columns_sql, str(self.execution_time_as_valid_from)]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -907,7 +907,7 @@ class CustomKind(_ModelKind):
         ]
 
     def to_expression(
-            self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
+        self, expressions: t.Optional[t.List[exp.Expression]] = None, **kwargs: t.Any
     ) -> d.ModelKind:
         return super().to_expression(
             expressions=[
@@ -996,9 +996,9 @@ def create_model_kind(v: t.Any, dialect: str, defaults: t.Dict[str, t.Any]) -> M
         # only pass the on_destructive_change user default to models inheriting from _Incremental
         # that don't explicitly set it in the model definition
         if (
-                issubclass(kind_type, _Incremental)
-                and props.get("on_destructive_change") is None
-                and defaults.get("on_destructive_change") is not None
+            issubclass(kind_type, _Incremental)
+            and props.get("on_destructive_change") is None
+            and defaults.get("on_destructive_change") is not None
         ):
             props["on_destructive_change"] = defaults.get("on_destructive_change")
 
