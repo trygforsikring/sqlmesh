@@ -24,11 +24,6 @@ if t.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-def _generate_topic_name(sink_name: str) -> str:
-    return sink_name.split('.', 1)[1]
-
-
 def _increment_sink_version(sink_name: str) -> str:
     """
     Increments the version number in the sink name.
@@ -77,27 +72,17 @@ def _extract_sink_name(view_name: TableName) -> t.Optional[str]:
         str: The extracted sink name, or None if the structure is invalid.
     """
 
-    # If view_name is a string
-    if isinstance(view_name, str):
-        parts = view_name.split('__')
-        if len(parts) > 2:
-            return parts[0] + '__' + parts[1] + '.' + parts[2]
+    # Convert the exp.Table object to a string representation (if needed)
+    table_name = str(view_name)
+    parts = table_name.split('__')
+
+    if table_name.endswith("__temp"):
         return None
 
-    # If view_name is an exp.Table object
-    elif isinstance(view_name, exp.Table):
-        # Convert the exp.Table object to a string representation (if needed)
-        table_name = str(view_name)
-        parts = table_name.split('__')
+    if len(parts) > 2:
+        return parts[2]
+    return None
 
-        if table_name.endswith("__temp"):
-            return None
-
-        if len(parts) > 2:
-            return view_name.db + '.' + parts[2]
-        return None
-
-    return None  # If neither string nor exp.Table
 
 
 def _find_latest_sink(sink_names: List[str]) -> str:
@@ -291,10 +276,10 @@ class RisingwaveEngineAdapter(
             return  # Exit the function without processing further
 
         sink_names = self._is_sink_exists(view_name, sink_name)
+
         topic = connections_str.properties.topic
-        print("topic ::",topic)
         if not sink_names:  # Check if sink_names is None or an empty list
-            sink_name = sink_name.split('__', 1)[1] + '_v1'  # Set to v1 if no sinks exist
+            sink_name = sink_name + '_v1'  # Set to v1 if no sinks exist
         else:
             if len(sink_names) > 1:
                 logger.warning("Found more than one version of sinks in the model ! Please clear the other versions of not required !")
@@ -302,24 +287,21 @@ class RisingwaveEngineAdapter(
             # If sink_names is not empty, find the latest sink and increment its version
             sink_name_latest = _find_latest_sink(sink_names)
             sink_name = _increment_sink_version(sink_name_latest)
+
             if topic is not None:
                 sink_name = sink_name_latest
                 _is_sink_need_drop = True
-        print("sink_name ::",sink_name)
 
         properties = connections_str.properties
         # Start finding topics
         if topic is None:
-            topic = _generate_topic_name(sink_name)
-            properties = properties.copy(update={"topic": topic})
+            properties = properties.copy(update={"topic": sink_name})
             connections_str = connections_str.copy(update={"properties": properties})
-        print("connections_str ::",connections_str)
 
         self._create_rw_sink(sink_name,view_name,connections_str,_is_sink_need_drop)
 
 
     def _create_rw_sink(self, sink_name: str, view_name: TableName,connections_str :RwSinkSettings,_is_sink_need_drop:bool) -> None:
-        print("_is_sink_need_drop ::",_is_sink_need_drop)
 
         '''sink_name = sink_name.split('__', 1)[1]'''
         if _is_sink_need_drop :
@@ -360,21 +342,14 @@ class RisingwaveEngineAdapter(
            Builds a SQL query to check for a table in information_schema.tables
            based on dbname.schema_name.table_name.
            """
-        print("view_name :: ",view_name)
-        print("sink_name :: ",sink_name)
-
-        sink_name_arr = sink_name.split('.', 1)
-        print("sink_name_like :: ",sink_name_arr[1])
-        print("sink_name_like db :: ",sink_name_arr[0])
         # Build the base query with WHERE conditions
         query = (
-            exp.select("CONCAT(table_schema,'.',table_name) AS table_name")
+            exp.select("table_name")
             .from_("information_schema.tables")
-            .where(exp.column("table_schema").eq(sink_name_arr[0]))
             .where(exp.column("table_type").eq("SINK"))
-            .where(f"table_name LIKE '{sink_name.split('.', 1)[1]}%'")
-        )
+            .where(f"table_name LIKE '{sink_name}_v%'")
 
+        )
         # Fetch the result as a DataFrame
         df = self.fetchdf(query)
 
