@@ -21,7 +21,7 @@ source .env/bin/activate
 Install the core SQLMesh library with `pip`:
 ```bash
 pip install psycopg2-binary
-pip install sqlmesh
+pip install .
 ```
 
 ## Getting Started
