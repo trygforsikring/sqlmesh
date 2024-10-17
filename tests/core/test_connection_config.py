@@ -17,6 +17,7 @@ from sqlmesh.core.config.connection import (
     SnowflakeConnectionConfig,
     TrinoAuthenticationMethod,
     AthenaConnectionConfig,
+    RisingwaveConnectionConfig,
     _connection_config_validator,
 )
 from sqlmesh.utils.errors import ConfigError
