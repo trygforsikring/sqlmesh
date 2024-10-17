@@ -325,6 +325,7 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
                 )
                 .else_(exp.column("TABLE_TYPE"))
                 .as_("type"),
+                exp.column("CLUSTERING_KEY").as_("clustering_key"),
             )
             .from_(exp.table_("TABLES", db="INFORMATION_SCHEMA", catalog=catalog_name))
             .where(exp.column("TABLE_SCHEMA").eq(schema.db))
@@ -343,6 +344,7 @@ class SnowflakeEngineAdapter(GetCurrentCatalogFromFunctionMixin, ClusteredByMixi
                 schema=row.schema_name,  # type: ignore
                 name=row.name,  # type: ignore
                 type=DataObjectType.from_str(row.type),  # type: ignore
+                clustering_key=row.clustering_key,  # type: ignore
             )
             for row in df.itertuples()
         ]

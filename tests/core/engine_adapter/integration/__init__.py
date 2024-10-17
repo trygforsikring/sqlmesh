@@ -13,8 +13,10 @@ from sqlmesh import Config, Context, EngineAdapter
 from sqlmesh.core.config import load_config_from_paths
 from sqlmesh.core.config.connection import AthenaConnectionConfig
 from sqlmesh.core.dialect import normalize_model_name
+import sqlmesh.core.dialect as d
 from sqlmesh.core.engine_adapter import SparkEngineAdapter, TrinoEngineAdapter, AthenaEngineAdapter
 from sqlmesh.core.engine_adapter.shared import DataObject
+from sqlmesh.core.model.definition import SqlModel, load_sql_based_model
 from sqlmesh.utils import random_id
 from sqlmesh.utils.date import to_ds
 from sqlmesh.utils.pydantic import PydanticModel
@@ -68,17 +70,22 @@ class TestContext:
         self,
         test_type: str,
         engine_adapter: EngineAdapter,
+        mark: str,
         gateway: str,
         is_remote: bool = False,
         columns_to_types: t.Optional[t.Dict[str, t.Union[str, exp.DataType]]] = None,
     ):
         self.test_type = test_type
         self.engine_adapter = engine_adapter
+        self.mark = mark
         self.gateway = gateway
         self._columns_to_types = columns_to_types
         self.test_id = random_id(short=True)
         self._context: t.Optional[Context] = None
         self.is_remote = is_remote
+        self._schemas: t.List[
+            str
+        ] = []  # keep track of any schemas returned from self.schema() / self.table() so we can drop them at the end
 
     @property
     def columns_to_types(self):
@@ -148,7 +155,16 @@ class TestContext:
                 self.engine_adapter.get_catalog_type(self.engine_adapter.default_catalog) != "hive"
             )
 
+        if self.dialect == "athena":
+            return "hive" not in self.mark
+
         return True
+
+    @property
+    def default_table_format(self) -> t.Optional[str]:
+        if self.dialect in {"athena", "trino"} and "_" in self.mark:
+            return self.mark.split("_", 1)[-1]  # take eg 'athena_iceberg' and return 'iceberg'
+        return None
 
     def add_test_suffix(self, value: str) -> str:
         return f"{value}_{self.test_id}"
@@ -198,6 +214,7 @@ class TestContext:
 
     def table(self, table_name: str, schema: str = TEST_SCHEMA) -> exp.Table:
         schema = self.add_test_suffix(schema)
+        self._schemas.append(schema)
         return exp.to_table(
             normalize_model_name(
                 ".".join([schema, table_name]),
@@ -213,8 +230,8 @@ class TestContext:
             return {k: exp.Literal.string(v) if isinstance(v, str) else v for k, v in props.items()}
         return {}
 
-    def schema(self, schema_name: str, catalog_name: t.Optional[str] = None) -> str:
-        return exp.table_name(
+    def schema(self, schema_name: str = TEST_SCHEMA, catalog_name: t.Optional[str] = None) -> str:
+        schema_name = exp.table_name(
             normalize_model_name(
                 self.add_test_suffix(
                     ".".join(
@@ -229,6 +246,8 @@ class TestContext:
                 dialect=self.dialect,
             )
         )
+        self._schemas.append(schema_name)
+        return schema_name
 
     def get_current_data(self, table: exp.Table) -> pd.DataFrame:
         df = self.engine_adapter.fetchdf(exp.select("*").from_(table), quote_identifiers=True)
@@ -366,7 +385,7 @@ class TestContext:
                     AND pgc.relkind = '{'v' if table_kind == "VIEW" else 'r'}'
                 ;
             """
-        elif self.dialect in ["mysql", "snowflake"]:
+        elif self.dialect in ["mysql", "snowflake", "trino"]:
             # Snowflake treats all identifiers as uppercase unless they are lowercase and quoted.
             # They are lowercase and quoted in sushi but not in the inline tests.
             if self.dialect == "snowflake" and snowflake_capitalize_ids:
@@ -376,6 +395,7 @@ class TestContext:
             comment_field_name = {
                 "mysql": "column_comment",
                 "snowflake": "comment",
+                "trino": "comment",
             }
 
             query = f"""
@@ -387,7 +407,6 @@ class TestContext:
                 WHERE
                     table_schema = '{schema_name}'
                     AND table_name = '{table_name}'
-                ;
             """
         elif self.dialect == "bigquery":
             query = f"""
@@ -404,9 +423,6 @@ class TestContext:
         elif self.dialect in ["spark", "databricks", "clickhouse"]:
             query = f"DESCRIBE TABLE {schema_name}.{table_name}"
             comment_index = 2 if self.dialect in ["spark", "databricks"] else 4
-        elif self.dialect == "trino":
-            query = f"SHOW COLUMNS FROM {schema_name}.{table_name}"
-            comment_index = 3
         elif self.dialect == "duckdb":
             query = f"""
                 SELECT
@@ -448,8 +464,18 @@ class TestContext:
         if config_mutator:
             config_mutator(self.gateway, config)
 
+        gateway_config = config.gateways[self.gateway]
+        if (
+            (sc := gateway_config.state_connection)
+            and (conn := gateway_config.connection)
+            and sc.type_ == "duckdb"
+        ):
+            # if duckdb is being used as the state connection, set concurrent_tasks=1 on the main connection
+            # to prevent duckdb from being accessed from multiple threads and getting deadlocked
+            conn.concurrent_tasks = 1
+
         if "athena" in self.gateway:
-            conn = config.gateways[self.gateway].connection
+            conn = gateway_config.connection
             assert isinstance(conn, AthenaConnectionConfig)
             assert isinstance(self.engine_adapter, AthenaEngineAdapter)
             # Ensure that s3_warehouse_location is propagated
@@ -486,15 +512,24 @@ class TestContext:
             self.engine_adapter.execute(f'DROP DATABASE IF EXISTS "{catalog_name}"')
 
     def cleanup(self, ctx: t.Optional[Context] = None):
-        schemas = [self.schema(TEST_SCHEMA)]
+        self._schemas.append(self.schema(TEST_SCHEMA))
 
         ctx = ctx or self._context
         if ctx and ctx.models:
             for _, model in ctx.models.items():
-                schemas.append(model.schema_name)
-                schemas.append(model.physical_schema)
+                self._schemas.append(model.schema_name)
+                self._schemas.append(model.physical_schema)
 
-        for schema_name in set(schemas):
+        for schema_name in set(self._schemas):
             self.engine_adapter.drop_schema(
                 schema_name=schema_name, ignore_if_not_exists=True, cascade=True
             )
+
+    def upsert_sql_model(self, model_definition: str) -> t.Tuple[Context, SqlModel]:
+        if not self._context:
+            self._context = self.create_context()
+
+        model = load_sql_based_model(expressions=d.parse(model_definition))
+        assert isinstance(model, SqlModel)
+        self._context.upsert_model(model)
+        return self._context, model

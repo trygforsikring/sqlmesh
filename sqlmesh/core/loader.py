@@ -129,6 +129,11 @@ class Loader(abc.ABC):
         self._context = context
         self._load_signals()
 
+    def load_materializations(self, context: GenericContext) -> None:
+        """Loads materializations for the built-in scheduler."""
+        self._context = context
+        self._load_materializations()
+
     def reload_needed(self) -> bool:
         """
         Checks for any modifications to the files the macros and models depend on
@@ -139,7 +144,7 @@ class Loader(abc.ABC):
         """
         return any(
             not path.exists() or path.stat().st_mtime > initial_mtime
-            for path, initial_mtime in self._path_mtimes.items()
+            for path, initial_mtime in self._path_mtimes.copy().items()
         )
 
     @abc.abstractmethod
