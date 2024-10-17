@@ -109,8 +109,6 @@ class TargetConfig(abc.ABC, DbtConfig):
             return MSSQLConfig(**data)
         elif db_type == "trino":
             return TrinoConfig(**data)
-        elif db_type == "risingwave":
-            return PostgresConfig(**data)
 
         raise ConfigError(f"{db_type} not supported.")
 
