@@ -859,7 +859,7 @@ class SnapshotEvaluator:
             select("COUNT(*)").from_(query.subquery("audit")),
             quote_identifiers=True,
         )  # type: ignore
-        if count and raise_exception:
+        if count:
             audit_error = AuditError(
                 audit_name=audit.name,
                 model=snapshot.model_or_none,
@@ -867,7 +867,7 @@ class SnapshotEvaluator:
                 query=query,
                 adapter_dialect=self.adapter.dialect,
             )
-            if blocking:
+            if raise_exception and blocking:
                 raise audit_error
             else:
                 logger.warning(f"{audit_error}\nAudit is warn only so proceeding with execution.")
@@ -1552,7 +1552,6 @@ class ViewStrategy(PromotableStrategy):
             return
 
         logger.info("Replacing view '%s'", table_name)
-
         self.adapter.create_view(
             table_name,
             query_or_df,
@@ -1562,8 +1561,6 @@ class ViewStrategy(PromotableStrategy):
             view_properties=model.physical_properties,
             table_description=model.description,
             column_descriptions=model.column_descriptions,
-            sink=self._is_sink(model),
-            connections_str=model.kind.connections_str,
         )
 
     def append(
@@ -1608,7 +1605,6 @@ class ViewStrategy(PromotableStrategy):
                 "clustered_by": model.clustered_by,
                 "partition_interval_unit": model.interval_unit,
             }
-
         self.adapter.create_view(
             table_name,
             model.render_query_or_raise(**render_kwargs),
@@ -1619,8 +1615,6 @@ class ViewStrategy(PromotableStrategy):
             view_properties=model.physical_properties,
             table_description=model.description if is_table_deployable else None,
             column_descriptions=model.column_descriptions if is_table_deployable else None,
-            sink=self._is_sink(model),
-            connections_str=model.kind.connections_str,
         )
 
     def migrate(
@@ -1642,8 +1636,6 @@ class ViewStrategy(PromotableStrategy):
             view_properties=model.physical_properties,
             table_description=model.description,
             column_descriptions=model.column_descriptions,
-            sink=self._is_sink(model),
-            connections_str=model.kind.connections_str,
         )
 
     def delete(self, name: str, **kwargs: t.Any) -> None:
@@ -1660,10 +1652,6 @@ class ViewStrategy(PromotableStrategy):
 
     def _is_materialized_view(self, model: Model) -> bool:
         return isinstance(model.kind, ViewKind) and model.kind.materialized
-
-    def _is_sink(self, model: Model) -> bool:
-        return isinstance(model.kind, ViewKind) and model.kind.sink
-
 
 
 class CustomMaterialization(MaterializableStrategy):

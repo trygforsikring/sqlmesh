@@ -100,7 +100,6 @@ class EngineAdapter:
     SUPPORTS_REPLACE_TABLE = True
     DEFAULT_CATALOG_TYPE = DIALECT
     QUOTE_IDENTIFIERS_IN_VIEWS = True
-    SUPPORTS_RW_SINK = False
 
     def __init__(
         self,
@@ -1208,7 +1207,21 @@ class EngineAdapter:
             low=low,
             high=high,
         )
-        self._insert_overwrite_by_condition(table_name, source_queries, columns_to_types, where)
+        return self._insert_overwrite_by_time_partition(
+            table_name, source_queries, columns_to_types, where, **kwargs
+        )
+
+    def _insert_overwrite_by_time_partition(
+        self,
+        table_name: TableName,
+        source_queries: t.List[SourceQuery],
+        columns_to_types: t.Dict[str, exp.DataType],
+        where: exp.Condition,
+        **kwargs: t.Any,
+    ) -> None:
+        return self._insert_overwrite_by_condition(
+            table_name, source_queries, columns_to_types, where
+        )
 
     def _values_to_sql(
         self,
@@ -2027,6 +2040,11 @@ class EngineAdapter:
         Yields:
             The table expression
         """
+        name = exp.to_table(name)
+        # ensure that we use default catalog if none is not specified
+        if isinstance(name, exp.Table) and not name.catalog and name.db:
+            name.set("catalog", value=self.default_catalog)
+
         source_queries, columns_to_types = self._get_source_queries_and_columns_to_types(
             query_or_df, columns_to_types=columns_to_types, target_table=name
         )
