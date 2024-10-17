@@ -46,6 +46,7 @@ from sqlmesh.utils.metaprogramming import (
 )
 
 if t.TYPE_CHECKING:
+    from sqlglot.dialects.dialect import DialectType
     from sqlmesh.core._typing import TableName
     from sqlmesh.core.audit import ModelAudit, Audit
     from sqlmesh.core.context import ExecutionContext
@@ -624,7 +625,15 @@ class _Model(ModelMeta, frozen=True):
 
             time_column_type = columns_to_types[self.time_column.column.name]
 
-            return to_time_column(time, time_column_type, self.time_column.format)
+            return to_time_column(
+                time,
+                time_column_type,
+                self.time_column.format,
+                include_microseconds=not (
+                    self.dialect in TIME_COLUMN_NO_MICROSECONDS_TYPES
+                    and time_column_type.is_type(*TIME_COLUMN_NO_MICROSECONDS_TYPES[self.dialect])
+                ),
+            )
         return exp.convert(time)
 
     def set_mapping_schema(self, schema: t.Dict) -> None:
@@ -1191,7 +1200,7 @@ class SqlModel(_SqlBasedModel):
                 return None
 
             expr = edit.expression
-            if _is_udtf(expr):
+            if isinstance(expr, exp.UDTF):
                 # projection subqueries do not change cardinality, engines don't allow these to return
                 # more than one row of data
                 parent = expr.find_ancestor(exp.Subquery)
@@ -1600,24 +1609,15 @@ def load_sql_based_model(
         if prop.name.lower() == "audits":
             model_audits = prop.args.get("value")
 
-    meta_python_env = _python_env(
-        expressions=meta,
-        jinja_macro_references=None,
+    meta_renderer = _meta_renderer(
+        expression=meta,
         module_path=module_path,
-        macros=macros or macro.get_registry(),
+        macros=macros,
+        jinja_macros=jinja_macros,
         variables=variables,
         path=path,
-    )
-    meta_renderer = ExpressionRenderer(
-        meta,
-        dialect,
-        [],
-        path=path,
-        jinja_macro_registry=jinja_macros,
-        python_env=meta_python_env,
+        dialect=dialect,
         default_catalog=default_catalog,
-        quote_identifiers=False,
-        normalize_identifiers=False,
     )
 
     rendered_meta_exprs = meta_renderer.render()
@@ -1953,6 +1953,19 @@ def create_python_model(
                 path=path,
             )
         )
+
+    dialect = kwargs.get("dialect")
+    name_renderer = _meta_renderer(
+        expression=d.parse_one(name, dialect=dialect),
+        module_path=module_path,
+        macros=macros,
+        jinja_macros=jinja_macros,
+        variables=variables,
+        path=path,
+        dialect=dialect,
+        default_catalog=kwargs.get("default_catalog"),
+    )
+    name = t.cast(t.List[exp.Expression], name_renderer.render())[0].sql(dialect=dialect)
 
     parsed_depends_on, referenced_variables = (
         _parse_dependencies(python_env, entrypoint) if python_env is not None else (set(), set())
@@ -2362,13 +2375,6 @@ def _is_projection(expr: exp.Expression) -> bool:
     return isinstance(parent, exp.Select) and expr.arg_key == "expressions"
 
 
-def _is_udtf(expr: exp.Expression) -> bool:
-    return isinstance(expr, (exp.Explode, exp.Posexplode, exp.Unnest)) or (
-        isinstance(expr, exp.Anonymous)
-        and expr.this.upper() in ("EXPLODE_OUTER", "POSEXPLODE_OUTER", "UNNEST")
-    )
-
-
 def _single_value_or_tuple(values: t.Sequence) -> exp.Identifier | exp.Tuple:
     return (
         exp.to_identifier(values[0])
@@ -2383,6 +2389,37 @@ def _single_expr_or_tuple(values: t.Sequence[exp.Expression]) -> exp.Expression 
 
 def _refs_to_sql(values: t.Any) -> exp.Expression:
     return exp.Tuple(expressions=values)
+
+
+def _meta_renderer(
+    expression: exp.Expression,
+    module_path: Path,
+    path: Path,
+    jinja_macros: t.Optional[JinjaMacroRegistry] = None,
+    macros: t.Optional[MacroRegistry] = None,
+    dialect: DialectType = None,
+    variables: t.Optional[t.Dict[str, t.Any]] = None,
+    default_catalog: t.Optional[str] = None,
+) -> ExpressionRenderer:
+    meta_python_env = _python_env(
+        expressions=expression,
+        jinja_macro_references=None,
+        module_path=module_path,
+        macros=macros or macro.get_registry(),
+        variables=variables,
+        path=path,
+    )
+    return ExpressionRenderer(
+        expression,
+        dialect,
+        [],
+        path=path,
+        jinja_macro_registry=jinja_macros,
+        python_env=meta_python_env,
+        default_catalog=default_catalog,
+        quote_identifiers=False,
+        normalize_identifiers=False,
+    )
 
 
 META_FIELD_CONVERTER: t.Dict[str, t.Callable] = {
@@ -2411,3 +2448,8 @@ META_FIELD_CONVERTER: t.Dict[str, t.Callable] = {
 def get_model_name(path: Path) -> str:
     path_parts = list(path.parts[path.parts.index("models") + 1 : -1]) + [path.stem]
     return ".".join(path_parts[-3:])
+
+
+TIME_COLUMN_NO_MICROSECONDS_TYPES = {
+    "clickhouse": (exp.DataType.Type.DATETIME, exp.DataType.Type.TIMESTAMP)
+}
