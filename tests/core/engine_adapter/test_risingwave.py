@@ -6,9 +6,7 @@ import pytest
 from sqlglot import exp, parse_one
 from sqlmesh.core.engine_adapter.risingwave import RisingwaveEngineAdapter
 
-from sqlmesh.core.engine_adapter.base_postgres import BasePostgresEngineAdapter
-
-pytestmark = [pytest.mark.engine, pytest.mark.postgres, pytest.mark.redshift]
+pytestmark = [pytest.mark.engine, pytest.mark.risingwave]
 
 def test_create_view(make_mocked_engine_adapter: t.Callable):
     adapter = make_mocked_engine_adapter(RisingwaveEngineAdapter)
