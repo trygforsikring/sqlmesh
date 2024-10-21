@@ -5,6 +5,7 @@ import os
 import pathlib
 import sys
 import typing as t
+import shutil
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -79,6 +80,7 @@ def test_type(request):
                 pytest.mark.duckdb,
                 pytest.mark.engine,
                 pytest.mark.slow,
+                # duckdb does not support concurrency so we run the tests sequentially
                 pytest.mark.xdist_group("engine_integration_duckdb"),
             ],
         ),
@@ -88,7 +90,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.postgres,
-                pytest.mark.xdist_group("engine_integration_postgres"),
             ],
         ),
         pytest.param(
@@ -97,7 +98,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.mysql,
-                pytest.mark.xdist_group("engine_integration_mysql"),
             ],
         ),
         pytest.param(
@@ -106,7 +106,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.mssql,
-                pytest.mark.xdist_group("engine_integration_mssql"),
             ],
         ),
         pytest.param(
@@ -115,7 +114,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.trino,
-                pytest.mark.xdist_group("engine_integration_trino"),
             ],
         ),
         pytest.param(
@@ -124,7 +122,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.trino_iceberg,
-                pytest.mark.xdist_group("engine_integration_trino_iceberg"),
             ],
         ),
         pytest.param(
@@ -133,7 +130,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.trino_delta,
-                pytest.mark.xdist_group("engine_integration_trino_delta"),
             ],
         ),
         pytest.param(
@@ -142,7 +138,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.spark,
-                pytest.mark.xdist_group("engine_integration_spark"),
             ],
         ),
         pytest.param(
@@ -151,7 +146,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.clickhouse,
-                pytest.mark.xdist_group("engine_integration_clickhouse"),
             ],
         ),
         pytest.param(
@@ -160,7 +154,6 @@ def test_type(request):
                 pytest.mark.docker,
                 pytest.mark.engine,
                 pytest.mark.clickhouse_cluster,
-                pytest.mark.xdist_group("engine_integration_clickhouse_cluster"),
             ],
         ),
         pytest.param(
@@ -169,7 +162,6 @@ def test_type(request):
                 pytest.mark.bigquery,
                 pytest.mark.engine,
                 pytest.mark.remote,
-                pytest.mark.xdist_group("engine_integration_bigquery"),
             ],
         ),
         pytest.param(
@@ -178,7 +170,6 @@ def test_type(request):
                 pytest.mark.databricks,
                 pytest.mark.engine,
                 pytest.mark.remote,
-                pytest.mark.xdist_group("engine_integration_databricks"),
             ],
         ),
         # TODO: add motherduck tests once they support DuckDB>=0.10.0
@@ -188,7 +179,6 @@ def test_type(request):
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.redshift,
-                pytest.mark.xdist_group("engine_integration_redshift"),
             ],
         ),
         pytest.param(
@@ -197,7 +187,6 @@ def test_type(request):
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.snowflake,
-                pytest.mark.xdist_group("engine_integration_snowflake"),
             ],
         ),
         pytest.param(
@@ -206,22 +195,29 @@ def test_type(request):
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.clickhouse_cloud,
-                pytest.mark.xdist_group("engine_integration_clickhouse_cloud"),
             ],
         ),
         pytest.param(
-            "athena",
+            "athena_hive",
             marks=[
                 pytest.mark.engine,
                 pytest.mark.remote,
                 pytest.mark.athena,
-                pytest.mark.xdist_group("engine_integration_athena"),
+            ],
+        ),
+        pytest.param(
+            "athena_iceberg",
+            marks=[
+                pytest.mark.engine,
+                pytest.mark.remote,
+                pytest.mark.athena,
             ],
         ),
     ]
 )
 def mark_gateway(request) -> t.Tuple[str, str]:
-    return request.param, f"inttest_{request.param}"
+    gateway = "athena" if "athena" in request.param else request.param
+    return request.param, f"inttest_{gateway}"
 
 
 @pytest.fixture
@@ -328,7 +324,6 @@ def test_drop_schema_catalog(ctx: TestContext, caplog):
 
 
 def test_temp_table(ctx: TestContext):
-    ctx.init()
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -338,7 +333,9 @@ def test_temp_table(ctx: TestContext):
     )
     table = ctx.table("example")
 
-    with ctx.engine_adapter.temp_table(ctx.input_data(input_data), table.sql()) as table_name:
+    with ctx.engine_adapter.temp_table(
+        ctx.input_data(input_data), table.sql(), table_format=ctx.default_table_format
+    ) as table_name:
         results = ctx.get_metadata_results()
         assert len(results.views) == 0
         assert len(results.tables) == 1
@@ -352,12 +349,12 @@ def test_temp_table(ctx: TestContext):
 
 def test_create_table(ctx: TestContext):
     table = ctx.table("test_table")
-    ctx.init()
     ctx.engine_adapter.create_table(
         table,
         {"id": exp.DataType.build("int")},
         table_description="test table description",
         column_descriptions={"id": "test id column description"},
+        table_format=ctx.default_table_format,
     )
     results = ctx.get_metadata_results()
     assert len(results.tables) == 1
@@ -373,8 +370,8 @@ def test_create_table(ctx: TestContext):
 
 
 def test_ctas(ctx: TestContext):
-    ctx.init()
     table = ctx.table("test_table")
+
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -387,8 +384,10 @@ def test_ctas(ctx: TestContext):
         ctx.input_data(input_data),
         table_description="test table description",
         column_descriptions={"id": "test id column description"},
+        table_format=ctx.default_table_format,
     )
-    results = ctx.get_metadata_results()
+
+    results = ctx.get_metadata_results(schema=table.db)
     assert len(results.views) == 0
     assert len(results.materialized_views) == 0
     assert len(results.tables) == len(results.non_temp_tables) == 1
@@ -396,8 +395,8 @@ def test_ctas(ctx: TestContext):
     ctx.compare_with_current(table, input_data)
 
     if ctx.engine_adapter.COMMENT_CREATION_TABLE.is_supported:
-        table_description = ctx.get_table_comment(table.db, "test_table")
-        column_comments = ctx.get_column_comments(table.db, "test_table")
+        table_description = ctx.get_table_comment(table.db, table.name)
+        column_comments = ctx.get_column_comments(table.db, table.name)
 
         assert table_description == "test table description"
         assert column_comments == {"id": "test id column description"}
@@ -416,7 +415,6 @@ def test_create_view(ctx: TestContext):
         ]
     )
     view = ctx.table("test_view")
-    ctx.init()
     ctx.engine_adapter.create_view(
         view,
         ctx.input_data(input_data),
@@ -466,7 +464,6 @@ def test_materialized_view(ctx: TestContext):
             {"id": 3, "ds": "2022-01-03"},
         ]
     )
-    ctx.init()
     source_table = ctx.table("source_table")
     ctx.engine_adapter.ctas(source_table, ctx.input_data(input_data), ctx.columns_to_types)
     view = ctx.table("test_view")
@@ -517,7 +514,6 @@ def test_nan_roundtrip(ctx: TestContext):
     if ctx.test_type != "df":
         pytest.skip("NaN roundtrip test only relevant for dataframes.")
     ctx.engine_adapter.DEFAULT_BATCH_SIZE = sys.maxsize
-    ctx.init()
     table = ctx.table("test_table")
     # Initial Load
     input_data = pd.DataFrame(
@@ -543,7 +539,6 @@ def test_nan_roundtrip(ctx: TestContext):
 
 def test_replace_query(ctx: TestContext):
     ctx.engine_adapter.DEFAULT_BATCH_SIZE = sys.maxsize
-    ctx.init()
     table = ctx.table("test_table")
     # Initial Load
     input_data = pd.DataFrame(
@@ -553,7 +548,9 @@ def test_replace_query(ctx: TestContext):
             {"id": 3, "ds": "2022-01-03"},
         ]
     )
-    ctx.engine_adapter.create_table(table, ctx.columns_to_types)
+    ctx.engine_adapter.create_table(
+        table, ctx.columns_to_types, table_format=ctx.default_table_format
+    )
     ctx.engine_adapter.replace_query(
         table,
         ctx.input_data(input_data),
@@ -562,6 +559,7 @@ def test_replace_query(ctx: TestContext):
         # exist prior to evaluation but when running these tests that isn't the case. As a result we just pass in
         # columns_to_types for these two engines so we can still test inference on the other ones
         columns_to_types=ctx.columns_to_types if ctx.dialect in ["spark", "databricks"] else None,
+        table_format=ctx.default_table_format,
     )
     results = ctx.get_metadata_results()
     assert len(results.views) == 0
@@ -585,6 +583,7 @@ def test_replace_query(ctx: TestContext):
             columns_to_types=(
                 ctx.columns_to_types if ctx.dialect in ["spark", "databricks"] else None
             ),
+            table_format=ctx.default_table_format,
         )
         results = ctx.get_metadata_results()
         assert len(results.views) == 0
@@ -596,7 +595,6 @@ def test_replace_query(ctx: TestContext):
 
 def test_replace_query_batched(ctx: TestContext):
     ctx.engine_adapter.DEFAULT_BATCH_SIZE = 1
-    ctx.init()
     table = ctx.table("test_table")
     # Initial Load
     input_data = pd.DataFrame(
@@ -606,7 +604,9 @@ def test_replace_query_batched(ctx: TestContext):
             {"id": 3, "ds": "2022-01-03"},
         ]
     )
-    ctx.engine_adapter.create_table(table, ctx.columns_to_types)
+    ctx.engine_adapter.create_table(
+        table, ctx.columns_to_types, table_format=ctx.default_table_format
+    )
     ctx.engine_adapter.replace_query(
         table,
         ctx.input_data(input_data),
@@ -615,6 +615,7 @@ def test_replace_query_batched(ctx: TestContext):
         # exist prior to evaluation but when running these tests that isn't the case. As a result we just pass in
         # columns_to_types for these two engines so we can still test inference on the other ones
         columns_to_types=ctx.columns_to_types if ctx.dialect in ["spark", "databricks"] else None,
+        table_format=ctx.default_table_format,
     )
     results = ctx.get_metadata_results()
     assert len(results.views) == 0
@@ -638,6 +639,7 @@ def test_replace_query_batched(ctx: TestContext):
             columns_to_types=(
                 ctx.columns_to_types if ctx.dialect in ["spark", "databricks"] else None
             ),
+            table_format=ctx.default_table_format,
         )
         results = ctx.get_metadata_results()
         assert len(results.views) == 0
@@ -648,9 +650,10 @@ def test_replace_query_batched(ctx: TestContext):
 
 
 def test_insert_append(ctx: TestContext):
-    ctx.init()
     table = ctx.table("test_table")
-    ctx.engine_adapter.create_table(table, ctx.columns_to_types)
+    ctx.engine_adapter.create_table(
+        table, ctx.columns_to_types, table_format=ctx.default_table_format
+    )
     # Initial Load
     input_data = pd.DataFrame(
         [
@@ -694,7 +697,6 @@ def test_insert_overwrite_by_time_partition(ctx: TestContext):
         ds_type = "varchar(max)"
 
     ctx.columns_to_types = {"id": "int", "ds": ds_type}
-    ctx.init()
     table = ctx.table("test_table")
     if ctx.dialect == "bigquery":
         partitioned_by = ["DATE(ds)"]
@@ -705,6 +707,7 @@ def test_insert_overwrite_by_time_partition(ctx: TestContext):
         ctx.columns_to_types,
         partitioned_by=partitioned_by,
         partition_interval_unit="DAY",
+        table_format=ctx.default_table_format,
     )
     input_data = pd.DataFrame(
         [
@@ -730,7 +733,7 @@ def test_insert_overwrite_by_time_partition(ctx: TestContext):
     assert results.non_temp_tables[0] == table.name
     ctx.compare_with_current(table, input_data.iloc[1:])
 
-    if test_type == "df":
+    if ctx.test_type == "df":
         overwrite_data = pd.DataFrame(
             [
                 {"id": 10, ctx.time_column: "2022-01-03"},
@@ -769,7 +772,6 @@ def test_merge(ctx: TestContext):
     if not ctx.supports_merge:
         pytest.skip(f"{ctx.dialect} doesn't support merge")
 
-    ctx.init()
     table = ctx.table("test_table")
 
     # Athena only supports MERGE on Iceberg tables
@@ -798,7 +800,7 @@ def test_merge(ctx: TestContext):
     assert results.non_temp_tables[0] == table.name
     ctx.compare_with_current(table, input_data)
 
-    if test_type == "df":
+    if ctx.test_type == "df":
         merge_data = pd.DataFrame(
             [
                 {"id": 2, "ds": "2022-01-10"},
@@ -832,6 +834,10 @@ def test_merge(ctx: TestContext):
 
 
 def test_scd_type_2_by_time(ctx: TestContext):
+    # Athena only supports the operations required for SCD models on Iceberg tables
+    if ctx.mark == "athena_hive":
+        pytest.skip("SCD Type 2 is only supported on Athena / Iceberg")
+
     time_type = exp.DataType.build("timestamp")
 
     ctx.columns_to_types = {
@@ -841,16 +847,14 @@ def test_scd_type_2_by_time(ctx: TestContext):
         "valid_from": time_type,
         "valid_to": time_type,
     }
-    ctx.init()
     table = ctx.table("test_table")
     input_schema = {
         k: v for k, v in ctx.columns_to_types.items() if k not in ("valid_from", "valid_to")
     }
 
-    # Athena only supports the operations required for SCD models on Iceberg tables
-    table_format = "iceberg" if ctx.dialect == "athena" else None
-
-    ctx.engine_adapter.create_table(table, ctx.columns_to_types, table_format=table_format)
+    ctx.engine_adapter.create_table(
+        table, ctx.columns_to_types, table_format=ctx.default_table_format
+    )
     input_data = pd.DataFrame(
         [
             {"id": 1, "name": "a", "updated_at": "2022-01-01 00:00:00"},
@@ -868,7 +872,7 @@ def test_scd_type_2_by_time(ctx: TestContext):
         execution_time="2023-01-01 00:00:00",
         updated_at_as_valid_from=False,
         columns_to_types=input_schema,
-        table_format=table_format,
+        table_format=ctx.default_table_format,
         truncate=True,
     )
     results = ctx.get_metadata_results()
@@ -930,7 +934,7 @@ def test_scd_type_2_by_time(ctx: TestContext):
         execution_time="2023-01-05 00:00:00",
         updated_at_as_valid_from=False,
         columns_to_types=input_schema,
-        table_format=table_format,
+        table_format=ctx.default_table_format,
         truncate=False,
     )
     results = ctx.get_metadata_results()
@@ -983,6 +987,10 @@ def test_scd_type_2_by_time(ctx: TestContext):
 
 
 def test_scd_type_2_by_column(ctx: TestContext):
+    # Athena only supports the operations required for SCD models on Iceberg tables
+    if ctx.mark == "athena_hive":
+        pytest.skip("SCD Type 2 is only supported on Athena / Iceberg")
+
     time_type = exp.DataType.build("timestamp")
 
     ctx.columns_to_types = {
@@ -992,16 +1000,14 @@ def test_scd_type_2_by_column(ctx: TestContext):
         "valid_from": time_type,
         "valid_to": time_type,
     }
-    ctx.init()
     table = ctx.table("test_table")
     input_schema = {
         k: v for k, v in ctx.columns_to_types.items() if k not in ("valid_from", "valid_to")
     }
 
-    # Athena only supports the operations required for SCD models on Iceberg tables
-    table_format = "iceberg" if ctx.dialect == "athena" else None
-
-    ctx.engine_adapter.create_table(table, ctx.columns_to_types, table_format=table_format)
+    ctx.engine_adapter.create_table(
+        table, ctx.columns_to_types, table_format=ctx.default_table_format
+    )
     input_data = pd.DataFrame(
         [
             {"id": 1, "name": "a", "status": "active"},
@@ -1158,12 +1164,12 @@ def test_scd_type_2_by_column(ctx: TestContext):
 def test_get_data_objects(ctx: TestContext):
     table = ctx.table("test_table")
     view = ctx.table("test_view")
-    ctx.init()
     ctx.engine_adapter.create_table(
         table,
         {"id": exp.DataType.build("int")},
         table_description="test table description",
         column_descriptions={"id": "test id column description"},
+        table_format=ctx.default_table_format,
     )
     ctx.engine_adapter.create_view(
         view,
@@ -1233,13 +1239,11 @@ def test_truncate_table(ctx: TestContext):
     if ctx.test_type != "query":
         pytest.skip("Truncate table test does not change based on input data type")
 
-    ctx.init()
     table = ctx.table("test_table")
 
-    # Athena only supports TRUNCATE (DELETE FROM <table>) on Iceberg tables
-    table_format = "iceberg" if ctx.dialect == "athena" else None
-
-    ctx.engine_adapter.create_table(table, ctx.columns_to_types, table_format=table_format)
+    ctx.engine_adapter.create_table(
+        table, ctx.columns_to_types, table_format=ctx.default_table_format
+    )
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -1259,7 +1263,6 @@ def test_transaction(ctx: TestContext):
     if ctx.test_type != "query":
         pytest.skip("Transaction test can just run for query")
 
-    ctx.init()
     table = ctx.table("test_table")
     input_data = pd.DataFrame(
         [
@@ -1280,9 +1283,20 @@ def test_transaction(ctx: TestContext):
     ctx.compare_with_current(table, input_data)
 
 
-def test_sushi(mark_gateway: t.Tuple[str, str], ctx: TestContext):
+def test_sushi(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
     if ctx.test_type != "query":
         pytest.skip("Sushi end-to-end tests only need to run for query")
+
+    if ctx.mark == "athena_hive":
+        pytest.skip(
+            "Sushi end-to-end tests only need to run once for Athena because sushi needs a hybrid of both Hive and Iceberg"
+        )
+
+    tmp_path = tmp_path_factory.mktemp(f"sushi_{ctx.test_id}")
+
+    sushi_test_schema = ctx.add_test_suffix("sushi")
+    sushi_state_schema = ctx.add_test_suffix("sushi_state")
+    raw_test_schema = ctx.add_test_suffix("raw")
 
     config = load_config_from_paths(
         Config,
@@ -1291,33 +1305,40 @@ def test_sushi(mark_gateway: t.Tuple[str, str], ctx: TestContext):
         ],
         personal_paths=[pathlib.Path("~/.sqlmesh/config.yaml").expanduser()],
     )
-    mark, gateway = mark_gateway
 
-    if mark == "athena":
+    current_gateway_config = config.gateways[ctx.gateway]
+    current_gateway_config.state_schema = sushi_state_schema
+    if (sc := current_gateway_config.state_connection) and sc.type_ == "duckdb":
+        current_gateway_config.connection.concurrent_tasks = 1  # duckdb cant handle parallelism
+
+    if ctx.dialect == "athena":
         # Ensure that this test is using the same s3_warehouse_location as TestContext (which includes the testrun_id)
-        config.gateways[
-            gateway
-        ].connection.s3_warehouse_location = ctx.engine_adapter.s3_warehouse_location
+        current_gateway_config.connection.s3_warehouse_location = (
+            ctx.engine_adapter.s3_warehouse_location
+        )
 
-    # clear cache from prior runs
-    cache_dir = pathlib.Path("./examples/sushi/.cache")
-    if cache_dir.exists():
-        import shutil
+    # Copy sushi example to tmpdir
+    shutil.copytree(pathlib.Path("./examples/sushi"), tmp_path, dirs_exist_ok=True)
 
-        shutil.rmtree(cache_dir)
+    # Rewrite schema references to test schema references
+    # Note that we deliberately do it at the filesystem level instead of messing with the Context to ensure
+    # that we are testing an actual Context rather than a doctored one
+    extensions = ["*.sql", "*.yaml", "*.py"]
+    replacements = {
+        "sushi.": f"{sushi_test_schema}.",
+        'sushi".': f'{sushi_test_schema}".',
+        " raw.": f" {raw_test_schema}.",
+        "NOT EXISTS raw;": f" NOT EXISTS {raw_test_schema};",
+    }
+    for ext in extensions:
+        for f in tmp_path.rglob(ext):
+            if f.is_file():
+                contents = f.read_text()
+                for search, replace in replacements.items():
+                    contents = contents.replace(search, replace)
+                f.write_text(contents)
 
-    context = Context(paths="./examples/sushi", config=config, gateway=gateway)
-
-    # clean up any leftover schemas from previous runs (requires context)
-    for schema in [
-        "sushi__test_prod",
-        "sushi__test_dev",
-        "sushi",
-        "sqlmesh__sushi",
-        "sqlmesh",
-        "raw",
-    ]:
-        context.engine_adapter.drop_schema(schema, ignore_if_not_exists=True, cascade=True)
+    context = Context(paths=tmp_path, config=config, gateway=ctx.gateway)
 
     start = to_date(now() - timedelta(days=7))
     end = now()
@@ -1369,20 +1390,23 @@ def test_sushi(mark_gateway: t.Tuple[str, str], ctx: TestContext):
             context._models.update({model_key: model_ch_cols_to_types})
 
         # create raw schema and view
-        if gateway == "inttest_clickhouse_cluster":
-            context.engine_adapter.execute("CREATE DATABASE IF NOT EXISTS raw ON CLUSTER cluster1;")
+        if ctx.gateway == "inttest_clickhouse_cluster":
             context.engine_adapter.execute(
-                "DROP VIEW IF EXISTS raw.demographics ON CLUSTER cluster1;"
+                f"CREATE DATABASE IF NOT EXISTS {raw_test_schema} ON CLUSTER cluster1;"
             )
             context.engine_adapter.execute(
-                "CREATE VIEW raw.demographics ON CLUSTER cluster1 AS SELECT 1 AS customer_id, '00000' AS zip;"
+                f"DROP VIEW IF EXISTS {raw_test_schema}.demographics ON CLUSTER cluster1;"
+            )
+            context.engine_adapter.execute(
+                f"CREATE VIEW {raw_test_schema}.demographics ON CLUSTER cluster1 AS SELECT 1 AS customer_id, '00000' AS zip;"
             )
 
-    # Athena needs models that get mutated after creation to be using Iceberg
     if ctx.dialect == "athena":
         for model_name in {"customer_revenue_lifetime"}:
             model_key = next(k for k in context._models if model_name in k)
-            model = context._models[model_key].copy(update={"table_format": "iceberg"})
+            model = context._models[model_key].copy(
+                update={"table_format": ctx.default_table_format}
+            )
             context._models.update({model_key: model})
 
     plan: Plan = context.plan(
@@ -1394,9 +1418,9 @@ def test_sushi(mark_gateway: t.Tuple[str, str], ctx: TestContext):
         auto_apply=True,
     )
 
-    data_validator = SushiDataValidator.from_context(context)
+    data_validator = SushiDataValidator.from_context(context, sushi_schema_name=sushi_test_schema)
     data_validator.validate(
-        "sushi.customer_revenue_lifetime",
+        f"{sushi_test_schema}.customer_revenue_lifetime",
         start,
         yesterday(),
         env_name="test_prod",
@@ -1590,14 +1614,23 @@ def test_sushi(mark_gateway: t.Tuple[str, str], ctx: TestContext):
             return None
 
         # confirm physical layer comments are registered
-        validate_comments("sqlmesh__sushi")
+        validate_comments(f"sqlmesh__{sushi_test_schema}", prod_schema_name=sushi_test_schema)
         # confirm physical temp table comments are not registered
-        validate_no_comments("sqlmesh__sushi", table_name_suffix="__temp", check_temp_tables=True)
+        validate_no_comments(
+            f"sqlmesh__{sushi_test_schema}",
+            table_name_suffix="__temp",
+            check_temp_tables=True,
+            prod_schema_name=sushi_test_schema,
+        )
         # confirm view layer comments are not registered in non-PROD environment
         env_name = "test_prod"
         if plan.environment_naming_info and plan.environment_naming_info.normalize_name:
             env_name = normalize_identifiers(env_name, dialect=ctx.dialect).name
-        validate_no_comments(f"sushi__{env_name}", is_physical_layer=False)
+        validate_no_comments(
+            f"{sushi_test_schema}__{env_name}",
+            is_physical_layer=False,
+            prod_schema_name=sushi_test_schema,
+        )
 
     # Ensure that the plan has been applied successfully.
     no_change_plan: Plan = context.plan(
@@ -1615,7 +1648,7 @@ def test_sushi(mark_gateway: t.Tuple[str, str], ctx: TestContext):
     context.apply(no_change_plan)
 
     data_validator.validate(
-        "sushi.customer_revenue_lifetime",
+        f"{sushi_test_schema}.customer_revenue_lifetime",
         start,
         yesterday(),
         env_name="test_dev",
@@ -1626,18 +1659,31 @@ def test_sushi(mark_gateway: t.Tuple[str, str], ctx: TestContext):
     # confirm view layer comments are registered in PROD
     if ctx.engine_adapter.COMMENT_CREATION_VIEW.is_supported:
         context.plan(skip_tests=True, no_prompts=True, auto_apply=True)
-        validate_comments("sushi", is_physical_layer=False)
+        validate_comments(sushi_test_schema, is_physical_layer=False)
+
+    # Register schemas for cleanup
+    for schema in [
+        f"{sushi_test_schema}__test_prod",
+        f"{sushi_test_schema}__test_dev",
+        sushi_test_schema,
+        f"sqlmesh__{sushi_test_schema}",
+        sushi_state_schema,
+        raw_test_schema,
+    ]:
+        ctx._schemas.append(schema)
 
 
-def test_init_project(ctx: TestContext, mark_gateway: t.Tuple[str, str], tmp_path: pathlib.Path):
+def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
     if ctx.test_type != "query":
         pytest.skip("Init example project end-to-end tests only need to run for query")
 
-    state_schema = "sqlmesh"
+    schema_name = ctx.add_test_suffix(TEST_SCHEMA)
+    state_schema = ctx.add_test_suffix("sqlmesh_state")
+
     object_names = {
-        "view_schema": ["sqlmesh_example"],
-        "physical_schema": ["sqlmesh__sqlmesh_example"],
-        "dev_schema": ["sqlmesh_example__test_dev"],
+        "view_schema": [schema_name],
+        "physical_schema": [f"sqlmesh__{schema_name}"],
+        "dev_schema": [f"{schema_name}__test_dev"],
         "views": ["full_model", "incremental_model", "seed_model"],
     }
 
@@ -1655,7 +1701,8 @@ def test_init_project(ctx: TestContext, mark_gateway: t.Tuple[str, str], tmp_pat
             k: [_normalize_snowflake(name) for name in v] for k, v in object_names.items()
         }
 
-    init_example_project(tmp_path, ctx.dialect)
+    init_example_project(tmp_path, ctx.dialect, schema_name=schema_name)
+
     config = load_config_from_paths(
         Config,
         project_paths=[
@@ -1663,29 +1710,36 @@ def test_init_project(ctx: TestContext, mark_gateway: t.Tuple[str, str], tmp_pat
         ],
         personal_paths=[pathlib.Path("~/.sqlmesh/config.yaml").expanduser()],
     )
+
     # ensure default dialect comes from init_example_project and not ~/.sqlmesh/config.yaml
     if config.model_defaults.dialect != ctx.dialect:
         config.model_defaults = config.model_defaults.copy(update={"dialect": ctx.dialect})
 
-    mark, gateway = mark_gateway
+    current_gateway_config = config.gateways[ctx.gateway]
+    if (sc := current_gateway_config.state_connection) and sc.type_ == "duckdb":
+        current_gateway_config.connection.concurrent_tasks = 1  # duckdb cant handle parallelism
 
-    if mark == "athena":
+    if ctx.dialect == "athena":
         # Ensure that this test is using the same s3_warehouse_location as TestContext (which includes the testrun_id)
-        config.gateways[
-            gateway
-        ].connection.s3_warehouse_location = ctx.engine_adapter.s3_warehouse_location
+        current_gateway_config.connection.s3_warehouse_location = (
+            ctx.engine_adapter.s3_warehouse_location
+        )
 
-    context = Context(paths=tmp_path, config=config, gateway=gateway)
+    # Ensure the state schema is unique to this test
+    config.gateways[ctx.gateway].state_schema = state_schema
+
+    context = Context(paths=tmp_path, config=config, gateway=ctx.gateway)
     ctx.engine_adapter = context.engine_adapter
 
-    # clean up any leftover schemas from previous runs (requires context)
-    for schema in [
-        state_schema,
-        *object_names["view_schema"],
-        *object_names["physical_schema"],
-        *object_names["dev_schema"],
-    ]:
-        context.engine_adapter.drop_schema(schema, ignore_if_not_exists=True, cascade=True)
+    if ctx.default_table_format:
+        # if the default table format is explicitly set, ensure its being used
+        replacement_models = {}
+        for model_key, model in context._models.items():
+            if not model.table_format:
+                replacement_models[model_key] = model.copy(
+                    update={"table_format": ctx.default_table_format}
+                )
+        context._models.update(replacement_models)
 
     # apply prod plan
     context.plan(auto_apply=True, no_prompts=True)
@@ -1721,6 +1775,15 @@ def test_init_project(ctx: TestContext, mark_gateway: t.Tuple[str, str], tmp_pat
     assert sorted(dev_schema_results.views) == object_names["views"]
     assert len(dev_schema_results.materialized_views) == 0
     assert len(dev_schema_results.tables) == len(dev_schema_results.non_temp_tables) == 0
+
+    # register the schemas to be cleaned up
+    for schema in [
+        state_schema,
+        *object_names["view_schema"],
+        *object_names["physical_schema"],
+        *object_names["dev_schema"],
+    ]:
+        ctx._schemas.append(schema)
 
 
 def test_dialects(ctx: TestContext):
