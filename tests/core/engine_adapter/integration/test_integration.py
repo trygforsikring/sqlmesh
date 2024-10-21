@@ -1613,15 +1613,8 @@ def test_sushi(ctx: TestContext, tmp_path_factory: pytest.TempPathFactory):
 
             return None
 
-        # confirm physical layer comments are registered
         validate_comments(f"sqlmesh__{sushi_test_schema}", prod_schema_name=sushi_test_schema)
-        # confirm physical temp table comments are not registered
-        validate_no_comments(
-            f"sqlmesh__{sushi_test_schema}",
-            table_name_suffix="__temp",
-            check_temp_tables=True,
-            prod_schema_name=sushi_test_schema,
-        )
+
         # confirm view layer comments are not registered in non-PROD environment
         env_name = "test_prod"
         if plan.environment_naming_info and plan.environment_naming_info.normalize_name:
@@ -1752,7 +1745,7 @@ def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
     physical_layer_results = ctx.get_metadata_results(object_names["physical_schema"][0])
     assert len(physical_layer_results.views) == 0
     assert len(physical_layer_results.materialized_views) == 0
-    assert len(physical_layer_results.tables) == len(physical_layer_results.non_temp_tables) == 6
+    assert len(physical_layer_results.tables) == len(physical_layer_results.non_temp_tables) == 3
 
     # make and validate unmodified dev environment
     no_change_plan: Plan = context.plan(
@@ -2098,9 +2091,10 @@ def test_managed_model_upstream_forward_only(ctx: TestContext):
     assert plan_1.snapshot_for(model_a).model.view_name in plan_1.schema_metadata.views
     assert plan_1.snapshot_for(model_b).model.view_name in plan_1.schema_metadata.views
 
-    assert len(plan_1.internal_schema_metadata.tables) == 3
+    assert len(plan_1.internal_schema_metadata.tables) == 2
+
     assert plan_1.table_name_for(model_a) in plan_1.internal_schema_metadata.tables
-    assert plan_1.dev_table_name_for(model_a) in plan_1.internal_schema_metadata.tables
+    assert plan_1.dev_table_name_for(model_a) not in plan_1.internal_schema_metadata.tables
     assert (
         plan_1.table_name_for(model_b) not in plan_1.internal_schema_metadata.tables
     )  # because its a managed table
