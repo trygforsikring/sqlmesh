@@ -1,11 +1,11 @@
 import path from 'path'
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react-swc'
+import cssInjectedByJsPlugin from 'vite-plugin-css-injected-by-js'
 
-const BASE_URL = process.env.BASE_URL ?? ''
-//const BASE = BASE_URL == null || BASE_URL === '' ? '/' : BASE_URL
-const BASE = '/proxy/8000/'
-const APP_BASE = '/proxy/8001/'
+const BASE_URL = '/proxy/8000/'
+const BASE = BASE_URL == null || BASE_URL === '' ? '/' : BASE_URL
+
 // https://vitejs.dev/config/
 export default defineConfig({
   base: BASE,
@@ -29,12 +29,13 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
+    modulePreload: false,
   },
   define: {
     __BASE_URL__: JSON.stringify(BASE_URL),
     __IS_HEADLESS__: JSON.stringify(Boolean(process.env.IS_HEADLESS ?? false)),
   },
-  plugins: [react()],
+  plugins: [react(), cssInjectedByJsPlugin()],
   test: {
     globals: true,
     environment: 'jsdom',
@@ -43,29 +44,29 @@ export default defineConfig({
   },
   server:
   process.env.NODE_ENV === 'testing'
-      ? {}
-      : 
- {
-          proxy: {
-            [`${BASE_URL}/api`]: {
-              target: 'http://api:8000',
-              rewrite: path => BASE,
-            },
-            [`${BASE_URL}/data-catalog`]: {
-              target: 'http://app:8001',
-              rewrite: path => BASE,
-            },
-            [`${BASE_URL}/data`]: {
-              target: 'http://app:8001',
-              rewrite: path => BASE,
-            },
-            [`${BASE_URL}/lineage`]: {
-              target: 'http://app:8001',
-              rewrite: path => BASE,
-            },
+    ? {}
+    : {
+        proxy: {
+          [`${BASE_URL}/api`]: {
+            target: 'http://api:8000',
+            rewrite: path => path.replace(`${BASE_URL}/api`, '/api'),
+          },
+          [`${BASE_URL}/data-catalog`]: {
+            target: 'http://app:8001',
+            rewrite: path => BASE,
+          },
+          [`${BASE_URL}/data`]: {
+            target: 'http://app:8001',
+            rewrite: path => BASE,
+          },
+          [`${BASE_URL}/lineage`]: {
+            target: 'http://app:8001',
+            rewrite: path => BASE,
           },
         },
+      },
   preview: {
     port: 8005,
   },
 })
+

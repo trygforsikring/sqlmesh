@@ -42,20 +42,7 @@ export async function fetchAPI<T = any, B extends object = any>(
     config
   const hasSearchParams = Object.keys({ ...params }).length > 0
   const fullUrl = url.replace(/([^:]\/)\/+/g, '$1')
-
-  let input = new URL(
-    `${getUrlPrefix()}${fullUrl}`.replaceAll('//', '/'),
-    window.location.origin,
-  )
-  if(url.includes('api/')) { 
-    const otherUrl = "/proxy/8000/"
-    input = new URL(
-      `${otherUrl}${fullUrl}`.replaceAll('//', '/'),
-      window.location.origin,
-    )
-  }
-
-  
+  const input = new URL(getUrlWithPrefix(fullUrl), window.location.origin)
 
   if (hasSearchParams) {
     const searchParams: Record<string, string> = Object.entries({
@@ -136,9 +123,21 @@ function toRequestBody(obj: unknown): BodyInit {
   }
 }
 
-export function getUrlPrefix(): string {
-  return '/proxy/8000/'
- //return isStringEmptyOrNil(window.__BASE_URL__) ? '/' : window.__BASE_URL__
+export function getUrlWithPrefix(url: string = '/'): string {
+  let urlWithPrefix = `${
+    isStringEmptyOrNil(window.__BASE_URL__) ? '/' : window.__BASE_URL__
+  }/${url}`
+
+  if(!urlWithPrefix.includes('proxy/8000')){
+    urlWithPrefix = `${'/proxy/8000/'}/${url}`
+  }
+
+  while (urlWithPrefix.includes('//')) {
+    urlWithPrefix = urlWithPrefix.replaceAll('//', '/')
+  }
+
+  return urlWithPrefix
 }
 
 export default fetchAPI
+

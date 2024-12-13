@@ -12,6 +12,8 @@ export default defineConfig({
           name: 'fetchAPI',
         },
       },
+      baseUrl: '/proxy/8000'
     },
   },
 })
+
