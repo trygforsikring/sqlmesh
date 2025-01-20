@@ -26,6 +26,7 @@
     "@codemirror/view": "^6.28.1",
     "@headlessui/react": "^1.7.17",
     "@heroicons/react": "^2.0.18",
+    "@lit/react": "^1.0.6",
     "@radix-ui/react-context-menu": "^2.1.4",
     "@radix-ui/react-select": "^1.2.2",
     "@tailwindcss/container-queries": "^0.1.1",
@@ -76,6 +77,7 @@
     "tailwindcss": "^3.3.3",
     "typescript": "^5.2.2",
     "vite": "^4.4.9",
+    "vite-plugin-css-injected-by-js": "^3.5.2",
     "vitest": "^0.34.3"
   }
 }

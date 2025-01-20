@@ -14,6 +14,7 @@ from sqlmesh.utils.date import TimeLike, to_datetime, validate_date_range
 from sqlmesh.utils.errors import ConfigError
 from sqlmesh.utils.pydantic import (
     PydanticModel,
+    SQLGlotCron,
     field_validator,
     model_validator,
     model_validator_v1_args,
@@ -194,7 +195,7 @@ class _Node(PydanticModel):
     owner: t.Optional[str] = None
     start: t.Optional[TimeLike] = None
     end: t.Optional[TimeLike] = None
-    cron: str = "@daily"
+    cron: SQLGlotCron = "@daily"
     interval_unit_: t.Optional[IntervalUnit] = Field(alias="interval_unit", default=None)
     tags: t.List[str] = []
     stamp: t.Optional[str] = None
@@ -240,19 +241,6 @@ class _Node(PydanticModel):
             raise ConfigError(f"'{v}' needs to be time-like: https://pypi.org/project/dateparser")
         return v
 
-    @field_validator("cron", mode="before")
-    @classmethod
-    def _cron_validator(cls, v: t.Any) -> t.Optional[str]:
-        cron = str_or_exp_to_str(v)
-        if cron:
-            from croniter import CroniterBadCronError, croniter
-
-            try:
-                croniter(cron)
-            except CroniterBadCronError:
-                raise ConfigError(f"Invalid cron expression '{cron}'")
-        return cron
-
     @field_validator("owner", "description", "stamp", mode="before")
     @classmethod
     def _string_expr_validator(cls, v: t.Any) -> t.Optional[str]:
@@ -272,12 +260,12 @@ class _Node(PydanticModel):
     @model_validator_v1_args
     def _node_root_validator(cls, values: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
         interval_unit = values.get("interval_unit_")
-        if interval_unit:
+        if interval_unit and not values.get("allow_partials"):
             cron = values["cron"]
             max_interval_unit = IntervalUnit.from_cron(cron)
             if interval_unit.seconds > max_interval_unit.seconds:
                 raise ConfigError(
-                    f"Interval unit of '{interval_unit}' is larger than cron period of '{cron}'"
+                    f"Cron '{cron}' cannot be more frequent than interval unit '{interval_unit.value}'. If this is intentional, set allow_partials to True."
                 )
         start = values.get("start")
         end = values.get("end")

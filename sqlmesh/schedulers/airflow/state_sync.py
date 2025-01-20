@@ -11,6 +11,7 @@ from sqlmesh.core.snapshot import (
     SnapshotIdLike,
     SnapshotInfoLike,
     SnapshotTableCleanupTask,
+    SnapshotNameVersion,
 )
 from sqlmesh.core.snapshot.definition import Interval, SnapshotIntervals
 from sqlmesh.core.state_sync import StateSync, Versions
@@ -235,9 +236,8 @@ class HttpStateSync(StateSync):
         Returns:
             The updated snapshots.
         """
-        raise NotImplementedError(
-            "Refreshing snapshot intervals is not supported by the Airflow state sync."
-        )
+        logger.warning("Refreshing snapshot intervals is not supported by the Airflow state sync")
+        return list(snapshots)
 
     def promote(
         self,
@@ -308,6 +308,13 @@ class HttpStateSync(StateSync):
         """
         raise NotImplementedError(
             "Compacting intervals is not supported by the Airflow state sync."
+        )
+
+    def update_auto_restatements(
+        self, next_auto_restatement_ts: t.Dict[SnapshotNameVersion, t.Optional[int]]
+    ) -> None:
+        raise NotImplementedError(
+            "Updating auto restatements is not supported by the Airflow state sync."
         )
 
     def migrate(

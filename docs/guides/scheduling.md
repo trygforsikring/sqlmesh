@@ -1,8 +1,9 @@
 # Scheduling guide
 
-SQLMesh currently offers two ways of scheduling model evaluation:
+SQLMesh currently offers three ways of scheduling model evaluation:
 
-* Using the [built-in scheduler](#built-in-scheduler)
+* Using [SQLMesh's built-in scheduler](#built-in-scheduler)
+* Using [Tobiko Cloud](../cloud/features/scheduler.md)
 * By [integrating with Airflow](#integrating-with-airflow)
 
 ## Built-in scheduler
@@ -95,7 +96,9 @@ $ sqlmesh plan
 ======================================================================
 Successfully Ran 1 tests against duckdb
 ----------------------------------------------------------------------
-Summary of differences against `prod`:
+Differences from the `prod` environment:
+
+Models
 └── Added Models:
     ├── sqlmesh_example.example_incremental_model
     └── sqlmesh_example.example_full_model

@@ -8,6 +8,7 @@ from sqlglot import expressions as exp
 from sqlglot import parse_one
 
 from sqlmesh.core.engine_adapter import RedshiftEngineAdapter
+from sqlmesh.utils.errors import SQLMeshError
 from tests.core.engine_adapter import to_sql_calls
 
 pytestmark = [pytest.mark.engine, pytest.mark.redshift]
@@ -74,7 +75,7 @@ def test_varchar_size_workaround(make_mocked_engine_adapter: t.Callable, mocker:
     )
 
     assert to_sql_calls(adapter) == [
-        'CREATE VIEW "__temp_ctas_test_random_id" AS SELECT "char", "char1" + 1 AS "char1", "char2" AS "char2", "varchar", "varchar256", "varchar2" FROM (SELECT * FROM "table")',
+        'CREATE VIEW "__temp_ctas_test_random_id" AS SELECT "char", "char1" + 1 AS "char1", "char2" AS "char2", "varchar", "varchar256", "varchar2" FROM (SELECT * FROM "table") WITH NO SCHEMA BINDING',
         'DROP VIEW IF EXISTS "__temp_ctas_test_random_id" CASCADE',
         'CREATE TABLE "test_schema"."test_table" ("char" CHAR, "char1" CHAR(max), "char2" CHAR(2), "varchar" VARCHAR, "varchar256" VARCHAR(max), "varchar2" VARCHAR(2))',
     ]
@@ -113,7 +114,7 @@ def test_create_table_from_query_exists_no_if_not_exists(
     )
 
     assert to_sql_calls(adapter) == [
-        'CREATE VIEW "__temp_ctas_test_random_id" AS SELECT "a", "b", "x" + 1 AS "c", "d" AS "d", "e" FROM (SELECT * FROM "table")',
+        'CREATE VIEW "__temp_ctas_test_random_id" AS SELECT "a", "b", "x" + 1 AS "c", "d" AS "d", "e" FROM (SELECT * FROM "table") WITH NO SCHEMA BINDING',
         'DROP VIEW IF EXISTS "__temp_ctas_test_random_id" CASCADE',
         'CREATE TABLE "test_schema"."test_table" ("a" VARCHAR(MAX), "b" VARCHAR(60), "c" VARCHAR(MAX), "d" VARCHAR(MAX), "e" TIMESTAMP)',
     ]
@@ -322,3 +323,84 @@ def test_alter_table_drop_column_cascade(adapter: t.Callable):
     assert to_sql_calls(adapter) == [
         'ALTER TABLE "test_table" DROP COLUMN "test_column" CASCADE',
     ]
+
+
+def test_merge(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+
+    adapter.merge(
+        target_table=exp.to_table("target_table_name"),
+        source_table=t.cast(exp.Select, parse_one('SELECT "ID", ts, val FROM source')),
+        columns_to_types={
+            "ID": exp.DataType.build("int"),
+            "ts": exp.DataType.build("timestamp"),
+            "val": exp.DataType.build("int"),
+        },
+        unique_key=[exp.to_identifier("ID", quoted=True)],
+    )
+
+    # Test additional predicates in the merge_filter
+    adapter.merge(
+        target_table=exp.to_table("target_table_name"),
+        source_table=t.cast(exp.Select, parse_one('SELECT "ID", ts, val FROM source')),
+        columns_to_types={
+            "ID": exp.DataType.build("int"),
+            "ts": exp.DataType.build("timestamp"),
+            "val": exp.DataType.build("int"),
+        },
+        unique_key=[exp.to_identifier("ID", quoted=True)],
+        merge_filter=exp.and_(
+            exp.and_(exp.column("ID", "__MERGE_SOURCE__") > 0),
+            exp.column("ts", "__MERGE_TARGET__") < exp.column("ts", "__MERGE_SOURCE__"),
+        ),
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        'MERGE INTO "target_table_name" USING (SELECT "ID", "ts", "val" FROM "source") AS "__MERGE_SOURCE__" ON "target_table_name"."ID" = "__MERGE_SOURCE__"."ID" WHEN MATCHED THEN UPDATE SET "ID" = "__MERGE_SOURCE__"."ID", "ts" = "__MERGE_SOURCE__"."ts", "val" = "__MERGE_SOURCE__"."val" WHEN NOT MATCHED THEN INSERT ("ID", "ts", "val") VALUES ("__MERGE_SOURCE__"."ID", "__MERGE_SOURCE__"."ts", "__MERGE_SOURCE__"."val")',
+        'MERGE INTO "target_table_name" USING (SELECT "ID", "ts", "val" FROM "source") AS "__MERGE_SOURCE__" ON ("__MERGE_SOURCE__"."ID" > 0 AND "target_table_name"."ts" < "__MERGE_SOURCE__"."ts") AND "target_table_name"."ID" = "__MERGE_SOURCE__"."ID" WHEN MATCHED THEN UPDATE SET "ID" = "__MERGE_SOURCE__"."ID", "ts" = "__MERGE_SOURCE__"."ts", "val" = "__MERGE_SOURCE__"."val" WHEN NOT MATCHED THEN INSERT ("ID", "ts", "val") VALUES ("__MERGE_SOURCE__"."ID", "__MERGE_SOURCE__"."ts", "__MERGE_SOURCE__"."val")',
+    ]
+
+
+def test_merge_when_matched_error(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+
+    with pytest.raises(
+        SQLMeshError,
+        match=r".*Redshift only supports a single WHEN MATCHED and WHEN NOT MATCHED clause*",
+    ):
+        adapter.merge(
+            target_table=exp.to_table("target_table_name"),
+            source_table=t.cast(exp.Select, parse_one('SELECT "ID", val FROM source')),
+            columns_to_types={
+                "ID": exp.DataType.build("int"),
+                "val": exp.DataType.build("int"),
+            },
+            unique_key=[exp.to_identifier("ID", quoted=True)],
+            when_matched=exp.Whens(
+                expressions=[
+                    exp.When(
+                        matched=True,
+                        condition=exp.column("ID", "__MERGE_SOURCE__").eq(exp.Literal.number(1)),
+                        then=exp.Update(
+                            expressions=[
+                                exp.column("val", "__MERGE_TARGET__").eq(
+                                    exp.column("val", "__MERGE_SOURCE__")
+                                ),
+                            ],
+                        ),
+                    ),
+                    exp.When(
+                        matched=True,
+                        source=False,
+                        then=exp.Update(
+                            expressions=[
+                                exp.column("val", "__MERGE_TARGET__").eq(
+                                    exp.column("val", "__MERGE_SOURCE__")
+                                ),
+                            ],
+                        ),
+                    ),
+                ]
+            ),
+        )

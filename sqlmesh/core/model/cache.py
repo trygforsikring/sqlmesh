@@ -131,10 +131,11 @@ class OptimizedQueryCache:
     @staticmethod
     def _entry_name(model: SqlModel) -> str:
         hash_data = _mapping_schema_hash_data(model.mapping_schema)
-        hash_data.append(gen(model.query))
+        hash_data.append(gen(model.query, comments=True))
         hash_data.append(str([gen(d) for d in model.macro_definitions]))
         hash_data.append(str([(k, v) for k, v in model.sorted_python_env]))
         hash_data.extend(model.jinja_macros.data_hash_values)
+        hash_data.extend(str(model.validate_query))
         return f"{model.name}_{crc32(hash_data)}"
 
 

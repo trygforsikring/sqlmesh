@@ -25,6 +25,7 @@ from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.notification_target import (
     NotificationTarget,
 )
+from sqlmesh.core.snapshot.definition import Interval, to_view_mapping
 from sqlmesh.core.plan.definition import EvaluatablePlan
 from sqlmesh.core.scheduler import Scheduler
 from sqlmesh.core.snapshot import (
@@ -42,7 +43,9 @@ from sqlmesh.core.user import User
 from sqlmesh.schedulers.airflow import common as airflow_common
 from sqlmesh.schedulers.airflow.client import AirflowClient, BaseAirflowClient
 from sqlmesh.schedulers.airflow.mwaa_client import MWAAClient
-from sqlmesh.utils.errors import SQLMeshError
+from sqlmesh.utils.errors import PlanError, SQLMeshError
+from sqlmesh.utils.dag import DAG
+from sqlmesh.utils.date import now
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +187,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             return
 
         scheduler = self.create_scheduler(snapshots_by_name.values())
-        is_run_successful = scheduler.run(
+        completion_status = scheduler.run(
             plan.environment,
             plan.start,
             plan.end,
@@ -199,8 +202,8 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             end_bounded=plan.end_bounded,
             interval_end_per_model=plan.interval_end_per_model,
         )
-        if not is_run_successful:
-            raise SQLMeshError("Plan application failed.")
+        if completion_status.is_failure:
+            raise PlanError("Plan application failed.")
 
     def _push(
         self,
@@ -221,12 +224,6 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             for s in snapshots.values()
             if s.is_model and not s.is_symbolic and plan.is_selected_for_backfill(s.name)
         ]
-        snapshots_to_create_count = len(snapshots_to_create)
-
-        if snapshots_to_create_count > 0:
-            self.console.start_creation_progress(
-                snapshots_to_create_count, plan.environment, self.default_catalog
-            )
 
         completed = False
         try:
@@ -235,6 +232,9 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                 snapshots,
                 allow_destructive_snapshots=plan.allow_destructive_models,
                 deployability_index=deployability_index,
+                on_start=lambda x: self.console.start_creation_progress(
+                    x, plan.environment, self.default_catalog
+                ),
                 on_complete=self.console.update_creation_progress,
             )
             completed = True
@@ -315,6 +315,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                 environment.naming_info,
                 deployability_index=deployability_index,
                 on_complete=lambda s: self.console.update_promotion_progress(s, True),
+                snapshots=snapshots,
             )
             if promotion_result.removed_environment_naming_info:
                 self._demote_snapshots(
@@ -323,6 +324,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                     promotion_result.removed_environment_naming_info,
                     on_complete=lambda s: self.console.update_promotion_progress(s, False),
                 )
+
             self.state_sync.finalize(environment)
             completed = True
         finally:
@@ -333,12 +335,23 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         plan: EvaluatablePlan,
         target_snapshots: t.Iterable[Snapshot],
         environment_naming_info: EnvironmentNamingInfo,
+        snapshots: t.Dict[SnapshotId, Snapshot],
         deployability_index: t.Optional[DeployabilityIndex] = None,
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]] = None,
     ) -> None:
         self.snapshot_evaluator.promote(
             target_snapshots,
-            environment_naming_info,
+            start=plan.start,
+            end=plan.end,
+            execution_time=plan.execution_time or now(),
+            snapshots=snapshots,
+            table_mapping=to_view_mapping(
+                snapshots.values(),
+                environment_naming_info,
+                default_catalog=self.default_catalog,
+                dialect=self.snapshot_evaluator.adapter.dialect,
+            ),
+            environment_naming_info=environment_naming_info,
             deployability_index=deployability_index,
             on_complete=on_complete,
         )
@@ -355,13 +368,62 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         )
 
     def _restate(self, plan: EvaluatablePlan, snapshots_by_name: t.Dict[str, Snapshot]) -> None:
-        if not plan.restatements:
+        if not plan.restatements or plan.is_dev:
             return
 
-        self.state_sync.remove_intervals(
-            [(snapshots_by_name[name], interval) for name, interval in plan.restatements.items()],
-            remove_shared_versions=not plan.is_dev,
+        snapshot_intervals_to_restate = {
+            (snapshots_by_name[name].table_info, intervals)
+            for name, intervals in plan.restatements.items()
+        }
+
+        # Restating intervals on prod plans should mean that the intervals are cleared across
+        # all environments, not just the version currently in prod
+        # This ensures that work done in dev environments can still be promoted to prod
+        # by forcing dev environments to re-run intervals that changed in prod
+        #
+        # Without this rule, its possible that promoting a dev table to prod will introduce old data to prod
+        snapshot_intervals_to_restate.update(
+            self._restatement_intervals_across_all_environments(plan.restatements)
         )
+
+        self.state_sync.remove_intervals(
+            snapshot_intervals=list(snapshot_intervals_to_restate),
+            remove_shared_versions=plan.is_prod,
+        )
+
+    def _restatement_intervals_across_all_environments(
+        self, prod_restatements: t.Dict[str, Interval]
+    ) -> t.Set[t.Tuple[SnapshotTableInfo, Interval]]:
+        """
+        Given a map of snapshot names + intervals to restate in prod:
+         - Look up matching snapshots across all environments (match based on name - regardless of version)
+         - For each match, also match downstream snapshots
+         - Return all matches mapped to the intervals of the prod snapshot being restated
+
+        The goal here is to produce a list of intervals to invalidate across all environments so that a cadence
+        run in those environments causes the intervals to be repopulated
+        """
+        if not prod_restatements:
+            return set()
+
+        snapshots_to_restate: t.Set[t.Tuple[SnapshotTableInfo, Interval]] = set()
+
+        for env in self.state_sync.get_environments():
+            keyed_snapshots = {s.name: s.table_info for s in env.snapshots}
+
+            # We dont just restate matching snapshots, we also have to restate anything downstream of them
+            # so that if A gets restated in prod and dev has A <- B <- C, B and C get restated in dev
+            env_dag = DAG({s.name: {p.name for p in s.parents} for s in env.snapshots})
+
+            for restatement, intervals in prod_restatements.items():
+                if restatement not in keyed_snapshots:
+                    continue
+                affected_snapshot_names = [restatement] + env_dag.downstream(restatement)
+                snapshots_to_restate.update(
+                    {(keyed_snapshots[a], intervals) for a in affected_snapshot_names}
+                )
+
+        return snapshots_to_restate
 
 
 class BaseAirflowPlanEvaluator(PlanEvaluator):
@@ -418,9 +480,9 @@ class BaseAirflowPlanEvaluator(PlanEvaluator):
                 self.dag_run_poll_interval_secs,
             )
             if not plan_application_succeeded:
-                raise SQLMeshError("Plan application failed.")
+                raise PlanError("Plan application failed.")
 
-            self.console.log_success("The plan has been applied successfully")
+            self.console.log_success("Plan applied successfully")
 
     @property
     def client(self) -> BaseAirflowClient:

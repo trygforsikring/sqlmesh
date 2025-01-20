@@ -58,7 +58,11 @@ bigquery_config = Config(
 test_config = Config(
     gateways={"in_memory": GatewayConfig(connection=DuckDBConnectionConfig())},
     default_gateway="in_memory",
-    plan=PlanConfig(auto_categorize_changes=CategorizerConfig(sql=AutoCategorizationMode.SEMI)),
+    plan=PlanConfig(
+        auto_categorize_changes=CategorizerConfig(
+            sql=AutoCategorizationMode.SEMI, python=AutoCategorizationMode.OFF
+        )
+    ),
     model_defaults=model_defaults,
 )
 
@@ -85,7 +89,7 @@ airflow_config_docker = Config(
 # A DuckDB config with a physical schema map.
 map_config = Config(
     default_connection=DuckDBConnectionConfig(),
-    physical_schema_override={"sushi": "company_internal"},
+    physical_schema_mapping={"^sushi$": "company_internal"},
     model_defaults=model_defaults,
 )
 

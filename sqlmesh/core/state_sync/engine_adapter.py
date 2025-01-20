@@ -27,6 +27,7 @@ from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
+from pydantic import Field
 from sqlglot import __version__ as SQLGLOT_VERSION
 from sqlglot import exp
 from sqlglot.helper import seq_get
@@ -37,10 +38,12 @@ from sqlmesh.core.console import Console, get_console
 from sqlmesh.core.engine_adapter import EngineAdapter
 from sqlmesh.core.environment import Environment
 from sqlmesh.core.model import ModelKindName, SeedModel
+from sqlmesh.core.node import IntervalUnit
 from sqlmesh.core.snapshot import (
     Intervals,
     Node,
     Snapshot,
+    SnapshotChangeCategory,
     SnapshotFingerprint,
     SnapshotId,
     SnapshotIdLike,
@@ -72,6 +75,8 @@ from sqlmesh.utils import major_minor, random_id, unique
 from sqlmesh.utils.dag import DAG
 from sqlmesh.utils.date import TimeLike, now, now_timestamp, time_like_to_str, to_timestamp
 from sqlmesh.utils.errors import ConflictingPlanError, SQLMeshError
+from sqlmesh.utils.migration import blob_text_type, index_text_type
+from sqlmesh.utils.pydantic import PydanticModel
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +128,15 @@ class EngineAdapterStateSync(StateSync):
         self.environments_table = exp.table_("_environments", db=self.schema)
         self.intervals_table = exp.table_("_intervals", db=self.schema)
         self.plan_dags_table = exp.table_("_plan_dags", db=self.schema)
+        self.auto_restatements_table = exp.table_("_auto_restatements", db=self.schema)
         self.versions_table = exp.table_("_versions", db=self.schema)
 
+        index_type = index_text_type(engine_adapter.dialect)
+        blob_type = blob_text_type(engine_adapter.dialect)
         self._snapshot_columns_to_types = {
-            "name": exp.DataType.build("text"),
-            "identifier": exp.DataType.build("text"),
-            "version": exp.DataType.build("text"),
+            "name": exp.DataType.build(index_type),
+            "identifier": exp.DataType.build(index_type),
+            "version": exp.DataType.build(index_type),
             "snapshot": exp.DataType.build("text"),
             "kind_name": exp.DataType.build("text"),
             "updated_ts": exp.DataType.build("bigint"),
@@ -138,26 +146,26 @@ class EngineAdapterStateSync(StateSync):
         }
 
         self._environment_columns_to_types = {
-            "name": exp.DataType.build("text"),
-            "snapshots": exp.DataType.build("text"),
+            "name": exp.DataType.build(index_type),
+            "snapshots": exp.DataType.build(blob_type),
             "start_at": exp.DataType.build("text"),
             "end_at": exp.DataType.build("text"),
             "plan_id": exp.DataType.build("text"),
             "previous_plan_id": exp.DataType.build("text"),
             "expiration_ts": exp.DataType.build("bigint"),
             "finalized_ts": exp.DataType.build("bigint"),
-            "promoted_snapshot_ids": exp.DataType.build("text"),
+            "promoted_snapshot_ids": exp.DataType.build(blob_type),
             "suffix_target": exp.DataType.build("text"),
             "catalog_name_override": exp.DataType.build("text"),
-            "previous_finalized_snapshots": exp.DataType.build("text"),
+            "previous_finalized_snapshots": exp.DataType.build(blob_type),
             "normalize_name": exp.DataType.build("boolean"),
-            "requirements": exp.DataType.build("text"),
+            "requirements": exp.DataType.build(blob_type),
         }
 
         self._interval_columns_to_types = {
-            "id": exp.DataType.build("text"),
+            "id": exp.DataType.build(index_type),
             "created_ts": exp.DataType.build("bigint"),
-            "name": exp.DataType.build("text"),
+            "name": exp.DataType.build(index_type),
             "identifier": exp.DataType.build("text"),
             "version": exp.DataType.build("text"),
             "start_ts": exp.DataType.build("bigint"),
@@ -165,12 +173,19 @@ class EngineAdapterStateSync(StateSync):
             "is_dev": exp.DataType.build("boolean"),
             "is_removed": exp.DataType.build("boolean"),
             "is_compacted": exp.DataType.build("boolean"),
+            "is_pending_restatement": exp.DataType.build("boolean"),
+        }
+
+        self._auto_restatement_columns_to_types = {
+            "snapshot_name": exp.DataType.build(index_type),
+            "snapshot_version": exp.DataType.build(index_type),
+            "next_auto_restatement_ts": exp.DataType.build("bigint"),
         }
 
         self._version_columns_to_types = {
             "schema_version": exp.DataType.build("int"),
-            "sqlglot_version": exp.DataType.build("text"),
-            "sqlmesh_version": exp.DataType.build("text"),
+            "sqlglot_version": exp.DataType.build(index_type),
+            "sqlmesh_version": exp.DataType.build(index_type),
         }
 
         self._snapshot_cache = SnapshotCache(context_path / c.CACHE)
@@ -314,7 +329,11 @@ class EngineAdapterStateSync(StateSync):
         }
 
         added_table_infos = set(table_infos.values())
-        if existing_environment and existing_environment.finalized_ts:
+        if (
+            existing_environment
+            and existing_environment.finalized_ts
+            and not existing_environment.expiration_ts
+        ):
             # Only promote new snapshots.
             added_table_infos -= set(existing_environment.promoted_snapshots)
 
@@ -419,16 +438,20 @@ class EngineAdapterStateSync(StateSync):
         current_ts = now()
 
         target_snapshot_ids = {s.snapshot_id for s in snapshots}
-        snapshots = self._get_snapshots_with_same_version(snapshots, lock_for_update=True)
+        same_version_snapshots = self._get_snapshots_with_same_version(
+            snapshots, lock_for_update=True
+        )
         target_snapshots_by_version = {
-            (s.name, s.version): s for s in snapshots if s.snapshot_id in target_snapshot_ids
+            (s.name, s.version): s
+            for s in same_version_snapshots
+            if s.snapshot_id in target_snapshot_ids
         }
 
         unpaused_snapshots: t.Dict[int, t.List[SnapshotId]] = defaultdict(list)
         paused_snapshots: t.List[SnapshotId] = []
         unrestorable_snapshots: t.List[SnapshotId] = []
 
-        for snapshot in snapshots:
+        for snapshot in same_version_snapshots:
             is_target_snapshot = snapshot.snapshot_id in target_snapshot_ids
             if is_target_snapshot and not snapshot.unpaused_ts:
                 logger.info("Unpausing snapshot %s", snapshot.snapshot_id)
@@ -449,8 +472,14 @@ class EngineAdapterStateSync(StateSync):
                         snapshot.snapshot_id,
                         target_snapshot.snapshot_id,
                     )
+                    full_snapshot = snapshot.full_snapshot
                     self.remove_intervals(
-                        [(snapshot, snapshot.get_removal_interval(effective_from_ts, current_ts))]
+                        [
+                            (
+                                full_snapshot,
+                                full_snapshot.get_removal_interval(effective_from_ts, current_ts),
+                            )
+                        ]
                     )
 
                 if snapshot.unpaused_ts:
@@ -540,7 +569,7 @@ class EngineAdapterStateSync(StateSync):
             for snapshot in environment.snapshots
         }
 
-        def _is_snapshot_used(snapshot: Snapshot) -> bool:
+        def _is_snapshot_used(snapshot: SharedVersionSnapshot) -> bool:
             return (
                 snapshot.snapshot_id in promoted_snapshot_ids
                 or snapshot.snapshot_id not in expired_candidates
@@ -556,28 +585,26 @@ class EngineAdapterStateSync(StateSync):
             snapshots_by_temp_version = defaultdict(set)
             for s in snapshots:
                 snapshots_by_version[(s.name, s.version)].add(s.snapshot_id)
-                snapshots_by_temp_version[(s.name, s.temp_version_get_or_generate())].add(
-                    s.snapshot_id
-                )
+                snapshots_by_temp_version[(s.name, s.temp_version)].add(s.snapshot_id)
 
             expired_snapshots = [s for s in snapshots if not _is_snapshot_used(s)]
 
             if expired_snapshots:
-                self.delete_snapshots(expired_snapshots)
+                self.delete_snapshots([s.snapshot_id for s in expired_snapshots])
 
             for snapshot in expired_snapshots:
                 shared_version_snapshots = snapshots_by_version[(snapshot.name, snapshot.version)]
                 shared_version_snapshots.discard(snapshot.snapshot_id)
 
                 shared_temp_version_snapshots = snapshots_by_temp_version[
-                    (snapshot.name, snapshot.temp_version_get_or_generate())
+                    (snapshot.name, snapshot.temp_version)
                 ]
                 shared_temp_version_snapshots.discard(snapshot.snapshot_id)
 
                 if not shared_temp_version_snapshots:
                     cleanup_targets.append(
                         SnapshotTableCleanupTask(
-                            snapshot=snapshot.table_info,
+                            snapshot=snapshot.full_snapshot.table_info,
                             dev_table_only=bool(shared_version_snapshots),
                         )
                     )
@@ -641,6 +668,27 @@ class EngineAdapterStateSync(StateSync):
             self.engine_adapter.drop_table(table)
         self._snapshot_cache.clear()
         self.migrate(default_catalog)
+
+    @transactional()
+    def update_auto_restatements(
+        self, next_auto_restatement_ts: t.Dict[SnapshotNameVersion, t.Optional[int]]
+    ) -> None:
+        for where in self._snapshot_name_version_filter(
+            next_auto_restatement_ts, column_prefix="snapshot", alias=None
+        ):
+            self.engine_adapter.delete_from(self.auto_restatements_table, where=where)
+
+        next_auto_restatement_ts_filtered = {
+            k: v for k, v in next_auto_restatement_ts.items() if v is not None
+        }
+        if not next_auto_restatement_ts_filtered:
+            return
+
+        self.engine_adapter.insert_append(
+            self.auto_restatements_table,
+            _auto_restatements_to_df(next_auto_restatement_ts_filtered),
+            columns_to_types=self._auto_restatement_columns_to_types,
+        )
 
     def _update_environment(self, environment: Environment) -> None:
         self.engine_adapter.delete_from(
@@ -739,12 +787,14 @@ class EngineAdapterStateSync(StateSync):
                     updated_ts,
                     unpaused_ts,
                     unrestorable,
+                    next_auto_restatement_ts,
                 ) in self._fetchall(query):
                     snapshot = parse_snapshot(
                         serialized_snapshot=serialized_snapshot,
                         updated_ts=updated_ts,
                         unpaused_ts=unpaused_ts,
                         unrestorable=unrestorable,
+                        next_auto_restatement_ts=next_auto_restatement_ts,
                     )
                     snapshot_id = snapshot.snapshot_id
                     if snapshot_id in fetched_snapshots:
@@ -765,20 +815,46 @@ class EngineAdapterStateSync(StateSync):
             cached_snapshots_in_state: t.Set[SnapshotId] = set()
             for where in self._snapshot_id_filter(cached_snapshots):
                 query = (
-                    exp.select("name", "identifier", "updated_ts", "unpaused_ts", "unrestorable")
-                    .from_(exp.to_table(self.snapshots_table))
+                    exp.select(
+                        "name",
+                        "identifier",
+                        "updated_ts",
+                        "unpaused_ts",
+                        "unrestorable",
+                        "next_auto_restatement_ts",
+                    )
+                    .from_(exp.to_table(self.snapshots_table).as_("snapshots"))
+                    .join(
+                        exp.to_table(self.auto_restatements_table).as_("auto_restatements"),
+                        on=exp.and_(
+                            exp.column("name", table="snapshots").eq(
+                                exp.column("snapshot_name", table="auto_restatements")
+                            ),
+                            exp.column("version", table="snapshots").eq(
+                                exp.column("snapshot_version", table="auto_restatements")
+                            ),
+                        ),
+                        join_type="left",
+                        copy=False,
+                    )
                     .where(where)
                 )
                 if lock_for_update:
                     query = query.lock(copy=False)
-                for name, identifier, updated_ts, unpaused_ts, unrestorable in self._fetchall(
-                    query
-                ):
+                for (
+                    name,
+                    identifier,
+                    updated_ts,
+                    unpaused_ts,
+                    unrestorable,
+                    next_auto_restatement_ts,
+                ) in self._fetchall(query):
                     snapshot_id = SnapshotId(name=name, identifier=identifier)
                     snapshot = snapshots[snapshot_id]
                     snapshot.updated_ts = updated_ts
                     snapshot.unpaused_ts = unpaused_ts
                     snapshot.unrestorable = unrestorable
+                    snapshot.next_auto_restatement_ts = next_auto_restatement_ts
                     cached_snapshots_in_state.add(snapshot_id)
 
             missing_cached_snapshots = cached_snapshots - cached_snapshots_in_state
@@ -813,8 +889,22 @@ class EngineAdapterStateSync(StateSync):
                     "snapshots.updated_ts",
                     "snapshots.unpaused_ts",
                     "snapshots.unrestorable",
+                    "auto_restatements.next_auto_restatement_ts",
                 )
                 .from_(exp.to_table(self.snapshots_table).as_("snapshots"))
+                .join(
+                    exp.to_table(self.auto_restatements_table).as_("auto_restatements"),
+                    on=exp.and_(
+                        exp.column("name", table="snapshots").eq(
+                            exp.column("snapshot_name", table="auto_restatements")
+                        ),
+                        exp.column("version", table="snapshots").eq(
+                            exp.column("snapshot_version", table="auto_restatements")
+                        ),
+                    ),
+                    join_type="left",
+                    copy=False,
+                )
                 .where(where)
             )
             if lock_for_update:
@@ -825,7 +915,7 @@ class EngineAdapterStateSync(StateSync):
         self,
         snapshots: t.Collection[SnapshotNameVersionLike],
         lock_for_update: bool = False,
-    ) -> t.List[Snapshot]:
+    ) -> t.List[SharedVersionSnapshot]:
         """Fetches all snapshots that share the same version as the snapshots.
 
         The output includes the snapshots with the specified identifiers.
@@ -844,7 +934,15 @@ class EngineAdapterStateSync(StateSync):
 
         for where in self._snapshot_name_version_filter(snapshots):
             query = (
-                exp.select("snapshot", "updated_ts", "unpaused_ts", "unrestorable")
+                exp.select(
+                    "snapshot",
+                    "name",
+                    "identifier",
+                    "version",
+                    "updated_ts",
+                    "unpaused_ts",
+                    "unrestorable",
+                )
                 .from_(exp.to_table(self.snapshots_table).as_("snapshots"))
                 .where(where)
             )
@@ -854,15 +952,16 @@ class EngineAdapterStateSync(StateSync):
             snapshot_rows.extend(self._fetchall(query))
 
         return [
-            Snapshot(
-                **{
-                    **json.loads(snapshot),
-                    "updated_ts": updated_ts,
-                    "unpaused_ts": unpaused_ts,
-                    "unrestorable": unrestorable,
-                }
+            SharedVersionSnapshot.from_snapshot_record(
+                name=name,
+                identifier=identifier,
+                version=version,
+                updated_ts=updated_ts,
+                unpaused_ts=unpaused_ts,
+                unrestorable=unrestorable,
+                snapshot=snapshot,
             )
-            for snapshot, updated_ts, unpaused_ts, unrestorable in snapshot_rows
+            for snapshot, name, identifier, version, updated_ts, unpaused_ts, unrestorable in snapshot_rows
         ]
 
     def _get_versions(self, lock_for_update: bool = False) -> Versions:
@@ -932,8 +1031,8 @@ class EngineAdapterStateSync(StateSync):
                     logger.info(
                         "Adding %s (%s, %s) for snapshot %s",
                         "dev interval" if is_dev else "interval",
-                        start_ts,
-                        end_ts,
+                        time_like_to_str(start_ts),
+                        time_like_to_str(end_ts),
                         snapshot_id,
                     )
                     results.append((start_ts, end_ts))
@@ -960,7 +1059,11 @@ class EngineAdapterStateSync(StateSync):
                     ),
                 }
             )
-            if snapshot_intervals.intervals or snapshot_intervals.dev_intervals:
+            if (
+                snapshot_intervals.intervals
+                or snapshot_intervals.dev_intervals
+                or snapshot_intervals.pending_restatement_intervals
+            ):
                 intervals_to_insert.append(snapshot_intervals)
 
         if intervals_to_insert:
@@ -1074,7 +1177,11 @@ class EngineAdapterStateSync(StateSync):
                 .from_(exp.to_table(self.intervals_table).as_(table_alias))
                 .where(where, copy=False)
                 .where(
-                    exp.and_(exp.to_column("is_dev").not_(), exp.to_column("is_removed").not_()),
+                    exp.and_(
+                        exp.to_column("is_dev").not_(),
+                        exp.to_column("is_removed").not_(),
+                        exp.to_column("is_pending_restatement").not_(),
+                    ),
                     copy=False,
                 )
                 .group_by(name_col, version_col, copy=False)
@@ -1101,24 +1208,26 @@ class EngineAdapterStateSync(StateSync):
                 "id",
                 exp.column("name", table="intervals"),
                 exp.column("identifier", table="intervals"),
-                "version",
+                exp.column("version", table="intervals"),
                 "start_ts",
                 "end_ts",
                 "is_dev",
                 "is_removed",
+                "is_pending_restatement",
             )
             .from_(exp.to_table(self.intervals_table).as_("intervals"))
             .order_by(
                 exp.column("name", table="intervals"),
-                exp.column("identifier", table="intervals"),
+                exp.column("version", table="intervals"),
                 "created_ts",
                 "is_removed",
+                "is_pending_restatement",
             )
         )
 
         if uncompacted_only:
             query.join(
-                exp.select("name", "identifier")
+                exp.select("name", "version")
                 .from_(exp.to_table(self.intervals_table).as_("intervals"))
                 .where(exp.column("is_compacted").not_())
                 .distinct()
@@ -1127,8 +1236,8 @@ class EngineAdapterStateSync(StateSync):
                     exp.column("name", table="intervals").eq(
                         exp.column("name", table="uncompacted")
                     ),
-                    exp.column("identifier", table="intervals").eq(
-                        exp.column("identifier", table="uncompacted")
+                    exp.column("version", table="intervals").eq(
+                        exp.column("version", table="uncompacted")
                     ),
                 ),
                 copy=False,
@@ -1146,22 +1255,54 @@ class EngineAdapterStateSync(StateSync):
             rows = self._fetchall(query.where(where))
             interval_ids.update(row[0] for row in rows)
 
+            # Pending restatement intervals are aggregated per (name, version) as opposed to snapshot ID
+            pending_restatement_intervals: t.Dict[t.Tuple[str, str], Intervals] = defaultdict(list)
+            last_seen_identifier_per_version: t.Dict[t.Tuple[str, str], str] = {}
+
             intervals: t.Dict[t.Tuple[str, str, str], Intervals] = defaultdict(list)
             dev_intervals: t.Dict[t.Tuple[str, str, str], Intervals] = defaultdict(list)
             for row in rows:
-                _, name, identifier, version, start, end, is_dev, is_removed = row
+                (
+                    _,
+                    name,
+                    identifier,
+                    version,
+                    start,
+                    end,
+                    is_dev,
+                    is_removed,
+                    is_pending_restatement,
+                ) = row
                 intervals_key = (name, identifier, version)
                 target_intervals = intervals if not is_dev else dev_intervals
                 if is_removed:
                     target_intervals[intervals_key] = remove_interval(
                         target_intervals[intervals_key], start, end
                     )
+                elif is_pending_restatement:
+                    pending_restatement_intervals[(name, version)] = merge_intervals(
+                        [*pending_restatement_intervals[(name, version)], (start, end)]
+                    )
+                    last_seen_identifier_per_version[(name, version)] = identifier
                 else:
                     target_intervals[intervals_key] = merge_intervals(
                         [*target_intervals[intervals_key], (start, end)]
                     )
+                    if not is_dev:
+                        # Remove all pending restatement intervals recorded before the current interval has been added
+                        pending_restatement_intervals[(name, version)] = remove_interval(
+                            pending_restatement_intervals[(name, version)], start, end
+                        )
+                        last_seen_identifier_per_version[(name, version)] = identifier
 
             for name, identifier, version in {**intervals, **dev_intervals}:
+                # Only set the pending restatement intervals for the last seen snapshot per version
+                # FIXME: Remove this logic once intervals are stored per (name, version)
+                pending_restatement_intervals_for_snapshot = (
+                    pending_restatement_intervals.get((name, version), [])
+                    if last_seen_identifier_per_version.get((name, version)) == identifier
+                    else []
+                )
                 snapshot_intervals.append(
                     SnapshotIntervals(
                         name=name,
@@ -1169,6 +1310,7 @@ class EngineAdapterStateSync(StateSync):
                         version=version,
                         intervals=intervals.get((name, identifier, version), []),
                         dev_intervals=dev_intervals.get((name, identifier, version), []),
+                        pending_restatement_intervals=pending_restatement_intervals_for_snapshot,
                     )
                 )
 
@@ -1187,6 +1329,17 @@ class EngineAdapterStateSync(StateSync):
             for start_ts, end_ts in snapshot.dev_intervals:
                 new_intervals.append(
                     _interval_to_df(snapshot, start_ts, end_ts, is_dev=True, is_compacted=True)
+                )
+            for start_ts, end_ts in snapshot.pending_restatement_intervals:
+                new_intervals.append(
+                    _interval_to_df(
+                        snapshot,
+                        start_ts,
+                        end_ts,
+                        is_dev=False,
+                        is_compacted=True,
+                        is_pending_restatement=True,
+                    )
                 )
 
         if new_intervals:
@@ -1259,7 +1412,7 @@ class EngineAdapterStateSync(StateSync):
         """Rollback to the previous migration."""
         logger.info("Starting migration rollback.")
         tables = (self.snapshots_table, self.environments_table, self.versions_table)
-        optional_tables = (self.intervals_table, self.plan_dags_table)
+        optional_tables = (self.intervals_table, self.plan_dags_table, self.auto_restatements_table)
         versions = self.get_versions(validate=False)
         if versions.schema_version == 0:
             # Clean up state tables
@@ -1290,6 +1443,7 @@ class EngineAdapterStateSync(StateSync):
             self.versions_table,
             self.intervals_table,
             self.plan_dags_table,
+            self.auto_restatements_table,
         ):
             if self.engine_adapter.table_exists(table):
                 backup_name = _backup_table_name(table)
@@ -1304,16 +1458,24 @@ class EngineAdapterStateSync(StateSync):
     ) -> bool:
         versions = self.get_versions(validate=False)
         migrations = MIGRATIONS[versions.schema_version :]
-
-        migrate_rows = migrations or major_minor(SQLGLOT_VERSION) != versions.minor_sqlglot_version
-        if not skip_backup and migrate_rows:
+        should_backup = any(
+            [
+                migrations,
+                major_minor(SQLGLOT_VERSION) != versions.minor_sqlglot_version,
+                major_minor(SQLMESH_VERSION) != versions.minor_sqlmesh_version,
+            ]
+        )
+        if not skip_backup and should_backup:
             self._backup_state()
 
         for migration in migrations:
             logger.info(f"Applying migration {migration}")
             migration.migrate(self, default_catalog=default_catalog)
 
-        return bool(migrate_rows)
+        migrate_snapshots_and_environments = (
+            bool(migrations) or major_minor(SQLGLOT_VERSION) != versions.minor_sqlglot_version
+        )
+        return migrate_snapshots_and_environments
 
     def _migrate_rows(self, promoted_snapshots_only: bool) -> None:
         logger.info("Fetching environments")
@@ -1568,9 +1730,19 @@ class EngineAdapterStateSync(StateSync):
         self,
         snapshot_name_versions: t.Iterable[SnapshotNameVersionLike],
         alias: t.Optional[str] = "snapshots",
+        column_prefix: t.Optional[str] = None,
     ) -> t.Iterator[exp.Condition]:
         name_versions = sorted({(s.name, s.version) for s in snapshot_name_versions})
         batches = self._batches(name_versions)
+
+        name_column_name = "name"
+        version_column_name = "version"
+        if column_prefix:
+            name_column_name = f"{column_prefix}_{name_column_name}"
+            version_column_name = f"{column_prefix}_{version_column_name}"
+
+        name_column = exp.column(name_column_name, table=alias)
+        version_column = exp.column(version_column_name, table=alias)
 
         if not name_versions:
             yield exp.false()
@@ -1580,8 +1752,8 @@ class EngineAdapterStateSync(StateSync):
                     exp.Tuple,
                     exp.convert(
                         (
-                            exp.column("name", table=alias),
-                            exp.column("version", table=alias),
+                            name_column,
+                            version_column,
                         )
                     ),
                 ).isin(*versions)
@@ -1590,8 +1762,8 @@ class EngineAdapterStateSync(StateSync):
                 yield exp.or_(
                     *[
                         exp.and_(
-                            exp.column("name", table=alias).eq(name),
-                            exp.column("version", table=alias).eq(version),
+                            name_column.eq(name),
+                            version_column.eq(version),
                         )
                         for name, version in versions
                     ]
@@ -1629,22 +1801,23 @@ def _snapshots_intervals_to_df(
     snapshots_intervals: t.Sequence[SnapshotIntervals],
     is_removed: bool = False,
 ) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            _interval_to_df(
-                snapshot_intervals,
-                start_ts,
-                end_ts,
-                is_dev=is_dev,
-                is_removed=is_removed,
-            )
-            for snapshot_intervals in snapshots_intervals
-            for is_dev in (False, True)
-            for start_ts, end_ts in getattr(
-                snapshot_intervals, "dev_intervals" if is_dev else "intervals"
-            )
-        ]
-    )
+    interval_dicts = []
+    for snapshot_intervals in snapshots_intervals:
+        for interval_attr in ("dev_intervals", "intervals", "pending_restatement_intervals"):
+            is_pending_restatement = interval_attr == "pending_restatement_intervals"
+            is_dev = interval_attr == "dev_intervals"
+            for start_ts, end_ts in getattr(snapshot_intervals, interval_attr):
+                interval_dicts.append(
+                    _interval_to_df(
+                        snapshot_intervals,
+                        start_ts,
+                        end_ts,
+                        is_dev=is_dev,
+                        is_removed=is_removed,
+                        is_pending_restatement=is_pending_restatement,
+                    )
+                )
+    return pd.DataFrame(interval_dicts)
 
 
 def _interval_to_df(
@@ -1654,6 +1827,7 @@ def _interval_to_df(
     is_dev: bool = False,
     is_removed: bool = False,
     is_compacted: bool = False,
+    is_pending_restatement: bool = False,
 ) -> t.Dict[str, t.Any]:
     return {
         "id": random_id(),
@@ -1666,6 +1840,7 @@ def _interval_to_df(
         "is_dev": is_dev,
         "is_removed": is_removed,
         "is_compacted": is_compacted,
+        "is_pending_restatement": is_pending_restatement,
     }
 
 
@@ -1719,6 +1894,19 @@ def _environment_to_df(environment: Environment) -> pd.DataFrame:
     )
 
 
+def _auto_restatements_to_df(auto_restatements: t.Dict[SnapshotNameVersion, int]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "snapshot_name": name_version.name,
+                "snapshot_version": name_version.version,
+                "next_auto_restatement_ts": ts,
+            }
+            for name_version, ts in auto_restatements.items()
+        ]
+    )
+
+
 def _backup_table_name(table_name: TableName) -> exp.Table:
     table = exp.to_table(table_name).copy()
     table.set("this", exp.to_identifier(table.name + "_backup"))
@@ -1727,7 +1915,15 @@ def _backup_table_name(table_name: TableName) -> exp.Table:
 
 def _snapshot_to_json(snapshot: Snapshot) -> str:
     return snapshot.json(
-        exclude={"intervals", "dev_intervals", "updated_ts", "unpaused_ts", "unrestorable"}
+        exclude={
+            "intervals",
+            "dev_intervals",
+            "pending_restatement_intervals",
+            "updated_ts",
+            "unpaused_ts",
+            "unrestorable",
+            "next_auto_restatement_ts",
+        }
     )
 
 
@@ -1736,6 +1932,7 @@ def parse_snapshot(
     updated_ts: int,
     unpaused_ts: t.Optional[int],
     unrestorable: bool,
+    next_auto_restatement_ts: t.Optional[int],
 ) -> Snapshot:
     return Snapshot(
         **{
@@ -1743,6 +1940,7 @@ def parse_snapshot(
             "updated_ts": updated_ts,
             "unpaused_ts": unpaused_ts,
             "unrestorable": unrestorable,
+            "next_auto_restatement_ts": next_auto_restatement_ts,
         }
     )
 
@@ -1769,3 +1967,94 @@ class LazilyParsedSnapshots:
         if snapshot is None:
             raise KeyError(snapshot_id)
         return snapshot
+
+
+class SharedVersionSnapshot(PydanticModel):
+    """A stripped down version of a snapshot that is used for fetching snapshots that share the same version
+    with a significantly reduced parsing overhead.
+    """
+
+    name: str
+    version: str
+    temp_version_: t.Optional[str] = Field(alias="temp_version")
+    identifier: str
+    fingerprint: SnapshotFingerprint
+    interval_unit: IntervalUnit
+    change_category: SnapshotChangeCategory
+    updated_ts: int
+    unpaused_ts: t.Optional[int]
+    unrestorable: bool
+    disable_restatement: bool
+    effective_from: t.Optional[TimeLike]
+    raw_snapshot: t.Dict[str, t.Any]
+
+    @property
+    def snapshot_id(self) -> SnapshotId:
+        return SnapshotId(name=self.name, identifier=self.identifier)
+
+    @property
+    def is_forward_only(self) -> bool:
+        return self.change_category == SnapshotChangeCategory.FORWARD_ONLY
+
+    @property
+    def normalized_effective_from_ts(self) -> t.Optional[int]:
+        return (
+            to_timestamp(self.interval_unit.cron_floor(self.effective_from))
+            if self.effective_from
+            else None
+        )
+
+    @property
+    def temp_version(self) -> str:
+        return self.temp_version_ or self.fingerprint.to_version()
+
+    @property
+    def full_snapshot(self) -> Snapshot:
+        return Snapshot(
+            **{
+                **self.raw_snapshot,
+                "updated_ts": self.updated_ts,
+                "unpaused_ts": self.unpaused_ts,
+                "unrestorable": self.unrestorable,
+            }
+        )
+
+    def set_unpaused_ts(self, unpaused_dt: t.Optional[TimeLike]) -> None:
+        """Sets the timestamp for when this snapshot was unpaused.
+
+        Args:
+            unpaused_dt: The datetime object of when this snapshot was unpaused.
+        """
+        self.unpaused_ts = (
+            to_timestamp(self.interval_unit.cron_floor(unpaused_dt)) if unpaused_dt else None
+        )
+
+    @classmethod
+    def from_snapshot_record(
+        cls,
+        *,
+        name: str,
+        identifier: str,
+        version: str,
+        updated_ts: int,
+        unpaused_ts: t.Optional[int],
+        unrestorable: bool,
+        snapshot: str,
+    ) -> SharedVersionSnapshot:
+        raw_snapshot = json.loads(snapshot)
+        raw_node = raw_snapshot["node"]
+        return SharedVersionSnapshot(
+            name=name,
+            version=version,
+            temp_version=raw_snapshot.get("temp_version"),
+            identifier=identifier,
+            fingerprint=raw_snapshot["fingerprint"],
+            interval_unit=raw_node.get("interval_unit", IntervalUnit.from_cron(raw_node["cron"])),
+            change_category=raw_snapshot["change_category"],
+            updated_ts=updated_ts,
+            unpaused_ts=unpaused_ts,
+            unrestorable=unrestorable,
+            disable_restatement=raw_node.get("kind", {}).get("disable_restatement", False),
+            effective_from=raw_snapshot.get("effective_from"),
+            raw_snapshot=raw_snapshot,
+        )

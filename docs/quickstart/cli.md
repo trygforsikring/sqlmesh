@@ -1,6 +1,6 @@
 # CLI
 
-In this quick start guide, you'll use the SQLMesh command line interface (CLI) to get up and running with SQLMesh's scaffold generator. This example project will run locally on your computer using [DuckDB](https://duckdb.org/) as an embedded SQL engine.
+In this quickstart, you'll use the SQLMesh command line interface (CLI) to get up and running with SQLMesh's scaffold generator. This example project will run locally on your computer using [DuckDB](https://duckdb.org/) as an embedded SQL engine.
 
 Before beginning, ensure that you meet all the [prerequisites](../prerequisites.md) for using SQLMesh.
 
@@ -148,9 +148,10 @@ $ sqlmesh plan
 ======================================================================
 Successfully Ran 1 tests against duckdb
 ----------------------------------------------------------------------
-New environment `prod` will be created from `prod`
-Summary of differences against `prod`:
-└── Added Models:
+`prod` environment will be initialized
+
+Models:
+└── Added:
     ├── sqlmesh_example.seed_model
     ├── sqlmesh_example.incremental_model
     └── sqlmesh_example.full_model
@@ -165,9 +166,9 @@ Line 3 of the output notes that `sqlmesh plan` successfully executed the project
 
 Line 5 describes what environments the plan will affect when applied - a new `prod` environment in this case.
 
-Lines 7-10 of the output show that SQLMesh detected three new models relative to the current empty environment.
+Lines 7-11 of the output show that SQLMesh detected three new models relative to the current empty environment.
 
-Lines 11-14 list each model that will be executed by the plan, along with the date intervals that will be run. Note that `full_model` and `incremental_model` both show `2020-01-01` as their start date because:
+Lines 12-15 list each model that will be executed by the plan, along with the date intervals that will be run. Note that `full_model` and `incremental_model` both show `2020-01-01` as their start date because:
 
 1. The incremental model specifies that date in the `start` property of its `MODEL` statement and
 2. The full model depends on the incremental model.
@@ -249,7 +250,7 @@ The `seed_model` date range begins on the same day the plan was made because `SE
     GROUP BY item_id
     ```
 
-Line 15 asks you whether to proceed with executing the model backfills described in lines 11-14. Enter `y` and press `Enter`, and SQLMesh will execute the models and return this output:
+Line 16 asks you whether to proceed with executing the model backfills described in lines 11-14. Enter `y` and press `Enter`, and SQLMesh will execute the models and return this output:
 
 ```bash linenums="1"
 Apply - Backfill Tables [y/n]: y
@@ -324,7 +325,9 @@ $ sqlmesh plan dev
 Successfully Ran 1 tests against duckdb
 ----------------------------------------------------------------------
 New environment `dev` will be created from `prod`
-Summary of differences against `dev`:
+
+Differences from the `prod` environment:
+
 Models:
 ├── Directly Modified:
 │   └── sqlmesh_example__dev.incremental_model
@@ -353,9 +356,9 @@ Enter the backfill start date (eg. '1 year', '2020-01-01') or blank to backfill 
 
 Line 5 of the output states that a new environment `dev` will be created from the existing `prod` environment.
 
-Lines 6-11 summarize the differences between the modified model and the `prod` environment, detecting that we directly modified `incremental_model` and that `full_model` was indirectly modified because it selects from the incremental model. Note that the model schemas are `sqlmesh_example__dev`, indicating that they are being created in the `dev` environment.
+Lines 7-13 summarize the differences between the modified model and the `prod` environment, detecting that we directly modified `incremental_model` and that `full_model` was indirectly modified because it selects from the incremental model. Note that the model schemas are `sqlmesh_example__dev`, indicating that they are being created in the `dev` environment.
 
-On line 25, we see that SQLMesh automatically classified the change as `Non-breaking` because it understood that the change was additive (added a column not used by `full_model`) and did not invalidate any data already in `prod`.
+On line 27, we see that SQLMesh automatically classified the change as `Non-breaking` because it understood that the change was additive (added a column not used by `full_model`) and did not invalidate any data already in `prod`.
 
 Hit `Enter` at the prompt to backfill data from our start date `2020-01-01`. Another prompt will appear asking for a backfill end date; hit `Enter` to backfill until now. Finally, enter `y` and press `Enter` to apply the plan and execute the backfill:
 
@@ -431,7 +434,8 @@ $ sqlmesh plan
 ======================================================================
 Successfully Ran 1 tests against duckdb
 ----------------------------------------------------------------------
-Summary of differences against `prod`:
+Differences from the `prod` environment:
+
 Models:
 ├── Directly Modified:
 │   └── sqlmesh_example.incremental_model

@@ -320,7 +320,9 @@ MODEL (
   name db.employees,
   kind INCREMENTAL_BY_UNIQUE_KEY (
     unique_key name,
-    when_matched WHEN MATCHED THEN UPDATE SET target.salary = COALESCE(source.salary, target.salary)
+    when_matched (
+      WHEN MATCHED THEN UPDATE SET target.salary = COALESCE(source.salary, target.salary)
+    )
   )
 );
 ```
@@ -334,8 +336,10 @@ MODEL (
   name db.employees,
   kind INCREMENTAL_BY_UNIQUE_KEY (
     unique_key name,
-    when_matched WHEN MATCHED AND source.value IS NULL THEN UPDATE SET target.salary = COALESCE(source.salary, target.salary),
-    WHEN MATCHED THEN UPDATE SET target.title = COALESCE(source.title, target.title)
+    when_matched (
+      WHEN MATCHED AND source.value IS NULL THEN UPDATE SET target.salary = COALESCE(source.salary, target.salary)
+      WHEN MATCHED THEN UPDATE SET target.title = COALESCE(source.title, target.title)
+    )
   )
 );
 ```
@@ -345,8 +349,33 @@ MODEL (
 * BigQuery
 * Databricks
 * Postgres
+* Redshift
 * Snowflake
 * Spark
+
+Redshift supports only the `UPDATE` or `DELETE` actions for the `WHEN MATCHED` clause and does not allow multiple `WHEN MATCHED` expressions. For further information, refer to the [Redshift documentation](https://docs.aws.amazon.com/redshift/latest/dg/r_MERGE.html#r_MERGE-parameters).
+
+### Merge Filter Expression
+
+The `MERGE` statement typically induces a full table scan of the existing table, which can be problematic with large data volumes. 
+
+Prevent a full table scan by passing filtering conditions to the `merge_filter` parameter.
+
+The `merge_filter` accepts a single or a conjunction of predicates to be used in the `ON` clause of the `MERGE` operation: 
+
+```sql linenums="1" hl_lines="5"
+MODEL (
+  name db.employee_contracts,
+  kind INCREMENTAL_BY_UNIQUE_KEY (
+    unique_key id,
+    merge_filter source._operation IS NULL AND target.contract_date > dateadd(day, -7, current_date) 
+  )
+);
+```
+
+Similar to `when_matched`, the `source` and `target` aliases are used to distinguish between the source and target tables.
+
+If an existing dbt project uses the [incremental_predicates](https://docs.getdbt.com/docs/build/incremental-strategy#about-incremental_predicates) functionality, SQLMesh will automatically convert them into the equivalent `merge_filter` specification.
 
 ### Materialization strategy
 Depending on the target engine, models of the `INCREMENTAL_BY_UNIQUE_KEY` kind are materialized using the following strategies:
@@ -438,7 +467,7 @@ During the evaluation of a model of this kind, the view will be replaced or recr
 ## EMBEDDED
 Embedded models are a way to share common logic between different models of other kinds.
 
-There are no data assets (tables or views) associated with `EMBEDDED` models in the data warehouse. Instead, an `EMBEDDED` model's query is injected directly into the query of each downstream model that references it.
+There are no data assets (tables or views) associated with `EMBEDDED` models in the data warehouse. Instead, an `EMBEDDED` model's query is injected directly into the query of each downstream model that references it, as a subquery.
 
 This example specifies a `EMBEDDED` model kind:
 ```sql linenums="1" hl_lines="3"
@@ -469,7 +498,7 @@ There are two ways to tracking changes: By Time (Recommended) or By Column.
 
 ### SCD Type 2 By Time (Recommended)
 
-SCD Type 2 By Time supports sourcing from tables that have an "Updated At" timestamp defined in the table that tells you when a given was last updated.
+SCD Type 2 By Time supports sourcing from tables that have an "Updated At" timestamp defined in the table that tells you when a given record was last updated.
 This is the recommended way since this "Updated At" gives you a precise time when the record was last updated and therefore improves the accuracy of the SCD Type 2 table that is produced.
 
 This example specifies a `SCD_TYPE_2_BY_TIME` model kind:
@@ -597,12 +626,7 @@ TABLE db.menu_items (
 
 A hard delete is when a record no longer exists in the source table. When this happens,
 
-If `invalidate_hard_deletes` is set to `true` (default):
-
-* `valid_to` column will be set to the time when the SQLMesh run started that detected the missing record (called `execution_time`).
-* If the record is added back, then the `valid_to` column will remain unchanged.
-
-If `invalidate_hard_deletes` is set to `false`:
+If `invalidate_hard_deletes` is set to `false` (default):
 
 * `valid_to` column will continue to be set to `NULL` (therefore still considered "valid")
 * If the record is added back, then the `valid_to` column will be set to the `valid_from` of the new record.
@@ -612,13 +636,18 @@ When a record is added back, the new record will be inserted into the table with
 * SCD_TYPE_2_BY_TIME: the largest of either the `updated_at` timestamp of the new record or the `valid_from` timestamp of the deleted record in the SCD Type 2 table
 * SCD_TYPE_2_BY_COLUMN: the `execution_time` when the record was detected again
 
-One way to think about `invalidate_hard_deletes` is that, if enabled, deletes are most accurately tracked in the SCD Type 2 table since it records when the delete occurred.
+If `invalidate_hard_deletes` is set to `true`:
+
+* `valid_to` column will be set to the time when the SQLMesh run started that detected the missing record (called `execution_time`).
+* If the record is added back, then the `valid_to` column will remain unchanged.
+
+One way to think about `invalidate_hard_deletes` is that, if `invalidate_hard_deletes` is set to `true`, deletes are most accurately tracked in the SCD Type 2 table since it records when the delete occurred.
 As a result though, you can have gaps between records if the there is a gap of time between when it was deleted and added back.
-If you would prefer to not have gaps, and a result consider missing records in source as still "valid", then you can set `invalidate_hard_deletes` to `false`.
+If you would prefer to not have gaps, and a result consider missing records in source as still "valid", then you can leave the default value or set `invalidate_hard_deletes` to `false`.
 
 ### Example of SCD Type 2 By Time in Action
 
-Lets say that you started with the following data in your source table:
+Lets say that you started with the following data in your source table and `invalidate_hard_deletes` is set to `true`:
 
 | ID | Name             | Price |     Updated At      |
 |----|------------------|:-----:|:-------------------:|
@@ -694,7 +723,7 @@ Since in this case the updated at timestamp did not change it is likely the item
 
 ### Example of SCD Type 2 By Column in Action
 
-Lets say that you started with the following data in your source table:
+Lets say that you started with the following data in your source table and `invalidate_hard_deletes` is set to `true`:
 
 | ID | Name             | Price |
 |----|------------------|:-----:|
@@ -769,12 +798,12 @@ This is the most accurate representation of the menu based on the source data pr
 
 ### Shared Configuration Options
 
-| Name                    | Description                                                                                                    | Type                      |
-|-------------------------|----------------------------------------------------------------------------------------------------------------|---------------------------|
-| unique_key              | Unique key used for identifying rows between source and target                                                 | List of strings or string |
-| valid_from_name         | The name of the `valid_from` column to create in the target table. Default: `valid_from`                       | string                    |
-| valid_to_name           | The name of the `valid_to` column to create in the target table. Default: `valid_to`                           | string                    |
-| invalidate_hard_deletes | If set to `true`, when a record is missing from the source table it will be marked as invalid. Default: `true` | bool                      |
+| Name                    | Description                                                                                                     | Type                      |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------|---------------------------|
+| unique_key              | Unique key used for identifying rows between source and target                                                  | List of strings or string |
+| valid_from_name         | The name of the `valid_from` column to create in the target table. Default: `valid_from`                        | string                    |
+| valid_to_name           | The name of the `valid_to` column to create in the target table. Default: `valid_to`                            | string                    |
+| invalidate_hard_deletes | If set to `true`, when a record is missing from the source table it will be marked as invalid. Default: `false` | bool                      |
 
 !!! tip "Important"
 
@@ -903,6 +932,46 @@ FROM
 GROUP BY
   id
 ```
+
+### Reset SCD Type 2 Model (clearing history)
+
+SCD Type 2 models are designed by default to protect the data that has been captured because it is not possible to recreate the history once it has been lost. 
+However, there are cases where you may want to clear the history and start fresh.
+For this use use case you will want to start by setting `disable_restatement` to `false` in the model definition.
+
+```sql linenums="1" hl_lines="5"
+MODEL (
+  name db.menu_items,
+  kind SCD_TYPE_2_BY_TIME (
+    unique_key id,
+    disable_restatement false
+  )
+);
+```
+
+Plan/apply this change to production. 
+Then you will want to [restate the model](../plans.md#restatement-plans).
+    
+```bash
+sqlmesh plan --restate-model db.menu_items
+```
+
+!!! warning
+
+    This will remove the historical data on the model which in most situations cannot be recovered.
+
+Once complete you will want to remove `disable_restatement` on the model definition which will set it back to `true` and prevent accidental data loss.
+
+```sql linenums="1"
+MODEL (
+  name db.menu_items,
+  kind SCD_TYPE_2_BY_TIME (
+    unique_key id,
+  )
+);
+```
+
+Plan/apply this change to production.
 
 ## EXTERNAL
 

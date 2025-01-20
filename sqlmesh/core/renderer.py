@@ -51,6 +51,8 @@ class BaseExpressionRenderer:
         quote_identifiers: bool = True,
         model_fqn: t.Optional[str] = None,
         normalize_identifiers: bool = True,
+        optimize_query: t.Optional[bool] = True,
+        validate_query: t.Optional[bool] = False,
     ):
         self._expression = expression
         self._dialect = dialect
@@ -65,6 +67,8 @@ class BaseExpressionRenderer:
         self.update_schema({} if schema is None else schema)
         self._cache: t.List[t.Optional[exp.Expression]] = []
         self._model_fqn = model_fqn
+        self._optimize_query_flag = optimize_query is not False
+        self._validate_query = validate_query
 
     def update_schema(self, schema: t.Dict[str, t.Any]) -> None:
         self.schema = d.normalize_mapping_schema(schema, dialect=self._dialect)
@@ -103,9 +107,11 @@ class BaseExpressionRenderer:
         if should_cache and self._cache:
             return self._cache
 
-        if self._model_fqn and "this_model" not in kwargs:
+        this_model = kwargs.pop("this_model", None)
+
+        if not this_model and self._model_fqn:
             this_snapshot = (snapshots or {}).get(self._model_fqn)
-            kwargs["this_model"] = self._resolve_table(
+            this_model = self._resolve_table(
                 self._model_fqn,
                 snapshots={self._model_fqn: this_snapshot} if this_snapshot else None,
                 deployability_index=deployability_index,
@@ -123,20 +129,27 @@ class BaseExpressionRenderer:
         }
 
         variables = kwargs.pop("variables", {})
-        jinja_env = self._jinja_macro_registry.build_environment(
+        jinja_env_kwargs = {
             **{**render_kwargs, **prepare_env(self._python_env), **variables},
-            snapshots=(snapshots or {}),
-            table_mapping=table_mapping,
-            deployability_index=deployability_index,
-            default_catalog=self._default_catalog,
-            runtime_stage=runtime_stage.value,
-            resolve_table=lambda table: self._resolve_table(
+            "snapshots": snapshots or {},
+            "table_mapping": table_mapping,
+            "deployability_index": deployability_index,
+            "default_catalog": self._default_catalog,
+            "runtime_stage": runtime_stage.value,
+            "resolve_table": lambda table: self._resolve_table(
                 table,
                 snapshots=snapshots,
                 table_mapping=table_mapping,
                 deployability_index=deployability_index,
-            ),
-        )
+            ).sql(dialect=self._dialect, identify=True, comments=False),
+        }
+        if this_model:
+            render_kwargs["this_model"] = this_model
+            jinja_env_kwargs["this_model"] = this_model.sql(
+                dialect=self._dialect, identify=True, comments=False
+            )
+
+        jinja_env = self._jinja_macro_registry.build_environment(**jinja_env_kwargs)
 
         if isinstance(self._expression, d.Jinja):
             try:
@@ -230,8 +243,8 @@ class BaseExpressionRenderer:
         snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
         table_mapping: t.Optional[t.Dict[str, str]] = None,
         deployability_index: t.Optional[DeployabilityIndex] = None,
-    ) -> str:
-        return exp.replace_tables(
+    ) -> exp.Table:
+        table = exp.replace_tables(
             exp.maybe_parse(table_name, into=exp.Table, dialect=self._dialect),
             {
                 **self._to_table_mapping((snapshots or {}).values(), deployability_index),
@@ -239,7 +252,12 @@ class BaseExpressionRenderer:
             },
             dialect=self._dialect,
             copy=False,
-        ).sql(dialect=self._dialect, identify=True, comments=False)
+        )
+        # We quote the table here to mimic the behavior of _resolve_tables, otherwise we may end
+        # up normalizing twice, because _to_table_mapping returns the mapped names unquoted.
+        return (
+            d.quote_identifiers(table, dialect=self._dialect) if self._quote_identifiers else table
+        )
 
     def _resolve_tables(
         self,
@@ -424,6 +442,8 @@ class QueryRenderer(BaseExpressionRenderer):
             runtime_stage, start, end, execution_time, *kwargs.values()
         )
 
+        needs_optimization = needs_optimization and self._optimize_query_flag
+
         if should_cache and self._optimized_cache:
             query = self._optimized_cache
         else:
@@ -508,11 +528,16 @@ class QueryRenderer(BaseExpressionRenderer):
         if self._model_fqn and not should_optimize and any(s.is_star for s in query.selects):
             deps = ", ".join(f"'{dep}'" for dep in sorted(missing_deps))
 
-            logger.warning(
+            warning = (
                 f"SELECT * cannot be expanded due to missing schema(s) for model(s): {deps}. "
                 "Run `sqlmesh create_external_models` and / or make sure that the model "
-                f"'{self._model_fqn}' can be rendered at parse time.",
+                f"'{self._model_fqn}' can be rendered at parse time."
             )
+
+            if self._validate_query:
+                raise_config_error(warning, self._path)
+
+            logger.warning(warning)
 
         try:
             if should_optimize:
@@ -531,11 +556,16 @@ class QueryRenderer(BaseExpressionRenderer):
                     )
                 )
         except SqlglotError as ex:
+            warning = (
+                f"{ex} for model '{self._model_fqn}', the column may not exist or is ambiguous"
+            )
+
+            if self._validate_query:
+                raise_config_error(warning, self._path)
+
             query = original
 
-            logger.warning(
-                "%s for model '%s', the column may not exist or is ambiguous", ex, self._model_fqn
-            )
+            logger.warning(warning)
         except Exception as ex:
             raise_config_error(
                 f"Failed to optimize query, please file an issue at https://github.com/TobikoData/sqlmesh/issues/new. {ex}",
