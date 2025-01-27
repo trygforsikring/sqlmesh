@@ -174,7 +174,7 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
             raise ConfigError(
                 "Please use connection type 'motherduck' without the `md:` prefix if you want to use a MotherDuck database as the single `database`."
             )
-        return values
+        return data
 
     @property
     def _engine_adapter(self) -> t.Type[EngineAdapter]:
@@ -870,9 +870,9 @@ class BigQueryConnectionConfig(ConnectionConfig):
     def validate_execution_project(
         cls,
         v: t.Optional[str],
-        values: t.Dict[str, t.Any],
+        info: ValidationInfo,
     ) -> t.Optional[str]:
-        if v and not values.get("project"):
+        if v and not info.data.get("project"):
             raise ConfigError(
                 "If the `execution_project` field is specified, you must also specify the `project` field to provide a default object location."
             )
