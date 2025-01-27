@@ -259,6 +259,11 @@ def test_forward_only_model_regular_plan(init_and_plan_context: t.Callable):
         SnapshotIntervals(
             snapshot_id=top_waiters_snapshot.snapshot_id,
             intervals=[
+                (to_timestamp("2023-01-01"), to_timestamp("2023-01-02")),
+                (to_timestamp("2023-01-02"), to_timestamp("2023-01-03")),
+                (to_timestamp("2023-01-03"), to_timestamp("2023-01-04")),
+                (to_timestamp("2023-01-04"), to_timestamp("2023-01-05")),
+                (to_timestamp("2023-01-05"), to_timestamp("2023-01-06")),
                 (to_timestamp("2023-01-06"), to_timestamp("2023-01-07")),
                 (to_timestamp("2023-01-07"), to_timestamp("2023-01-08")),
             ],
@@ -278,6 +283,12 @@ def test_forward_only_model_regular_plan(init_and_plan_context: t.Callable):
         SnapshotIntervals(
             snapshot_id=top_waiters_snapshot.snapshot_id,
             intervals=[
+                (to_timestamp("2023-01-01"), to_timestamp("2023-01-02")),
+                (to_timestamp("2023-01-02"), to_timestamp("2023-01-03")),
+                (to_timestamp("2023-01-03"), to_timestamp("2023-01-04")),
+                (to_timestamp("2023-01-04"), to_timestamp("2023-01-05")),
+                (to_timestamp("2023-01-05"), to_timestamp("2023-01-06")),
+                (to_timestamp("2023-01-06"), to_timestamp("2023-01-07")),
                 (to_timestamp("2023-01-07"), to_timestamp("2023-01-08")),
             ],
         ),
@@ -1923,7 +1934,7 @@ def test_restatement_plan_ignores_changes(init_and_plan_context: t.Callable):
     model = context.get_model("sushi.waiter_revenue_by_day")
     context.upsert_model(add_projection_to_model(t.cast(SqlModel, model)))
 
-    plan = context.plan_builder(restate_models=["sushi.top_waiters"], start="2023-01-07").build()
+    plan = context.plan_builder(restate_models=["sushi.top_waiters"]).build()
     assert plan.snapshots != context.snapshots
 
     assert not plan.directly_modified
@@ -1931,12 +1942,20 @@ def test_restatement_plan_ignores_changes(init_and_plan_context: t.Callable):
     assert not plan.new_snapshots
     assert plan.requires_backfill
     assert plan.restatements == {
-        restated_snapshot.snapshot_id: (to_timestamp("2023-01-07"), to_timestamp("2023-01-08"))
+        restated_snapshot.snapshot_id: (to_timestamp("2023-01-01"), to_timestamp("2023-01-08"))
     }
     assert plan.missing_intervals == [
         SnapshotIntervals(
             snapshot_id=restated_snapshot.snapshot_id,
-            intervals=[(to_timestamp("2023-01-07"), to_timestamp("2023-01-08"))],
+            intervals=[
+                (to_timestamp("2023-01-01"), to_timestamp("2023-01-02")),
+                (to_timestamp("2023-01-02"), to_timestamp("2023-01-03")),
+                (to_timestamp("2023-01-03"), to_timestamp("2023-01-04")),
+                (to_timestamp("2023-01-04"), to_timestamp("2023-01-05")),
+                (to_timestamp("2023-01-05"), to_timestamp("2023-01-06")),
+                (to_timestamp("2023-01-06"), to_timestamp("2023-01-07")),
+                (to_timestamp("2023-01-07"), to_timestamp("2023-01-08")),
+            ],
         )
     ]
 
@@ -3235,6 +3254,13 @@ def test_empty_bacfkill(init_and_plan_context: t.Callable):
     assert not plan.requires_backfill
     assert not plan.has_changes
     assert not plan.missing_intervals
+
+
+@time_machine.travel("2023-01-08 15:00:00 UTC")
+def test_dbt_requirements(sushi_dbt_context: Context):
+    assert set(sushi_dbt_context.requirements) == {"dbt-core", "dbt-duckdb"}
+    assert sushi_dbt_context.requirements["dbt-core"].startswith("1.")
+    assert sushi_dbt_context.requirements["dbt-duckdb"].startswith("1.")
 
 
 @pytest.mark.parametrize(

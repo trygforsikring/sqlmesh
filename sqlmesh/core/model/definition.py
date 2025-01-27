@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 import types
 import re
 import typing as t
@@ -53,17 +52,13 @@ from sqlmesh.utils.metaprogramming import (
 
 if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
-    from sqlmesh.core._typing import TableName
+    from sqlmesh.core._typing import Self, TableName
     from sqlmesh.core.context import ExecutionContext
     from sqlmesh.core.engine_adapter import EngineAdapter
     from sqlmesh.core.engine_adapter._typing import QueryOrDF
     from sqlmesh.core.snapshot import DeployabilityIndex, Node, Snapshot
     from sqlmesh.utils.jinja import MacroReference
 
-    if sys.version_info >= (3, 11):
-        from typing import Self
-    else:
-        from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
 
@@ -1391,6 +1386,10 @@ class SqlModel(_Model):
         data.extend(self.jinja_macros.data_hash_values)
         return data
 
+    @property
+    def _additional_metadata(self) -> t.List[str]:
+        return [*super()._additional_metadata, gen(self.query)]
+
 
 class SeedModel(_Model):
     """The model definition which uses a pre-built static dataset to source the data from.
@@ -1622,7 +1621,7 @@ class PythonModel(_Model):
         **kwargs: t.Any,
     ) -> t.Iterator[QueryOrDF]:
         env = prepare_env(self.python_env)
-        start, end = make_inclusive(start or c.EPOCH, end or c.EPOCH)
+        start, end = make_inclusive(start or c.EPOCH, end or c.EPOCH, self.dialect)
         execution_time = to_datetime(execution_time or c.EPOCH)
 
         variables = env.get(c.SQLMESH_VARS, {})

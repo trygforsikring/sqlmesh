@@ -2595,7 +2595,7 @@ def test_parse_expression_list_with_jinja():
         "JINJA_STATEMENT_BEGIN;\n{{ log('log message') }}\nJINJA_END;",
         "GRANT SELECT ON TABLE foo TO DEV",
     ]
-    assert input == [val.sql() for val in parse_expression(SqlModel, input, {})]
+    assert input == [val.sql() for val in parse_expression(SqlModel, input, None)]
 
 
 def test_no_depends_on_runtime_jinja_query():
@@ -3687,7 +3687,7 @@ def test_scd_type_2_by_time_overrides():
     assert not scd_type_2_model.kind.disable_restatement
 
     model_kind_dict = scd_type_2_model.kind.dict()
-    assert scd_type_2_model.kind == _model_kind_validator(None, model_kind_dict, {})
+    assert scd_type_2_model.kind == _model_kind_validator(None, model_kind_dict, None)
 
 
 def test_scd_type_2_by_column_defaults():
@@ -3776,7 +3776,7 @@ def test_scd_type_2_by_column_overrides():
     assert not scd_type_2_model.kind.disable_restatement
 
     model_kind_dict = scd_type_2_model.kind.dict()
-    assert scd_type_2_model.kind == _model_kind_validator(None, model_kind_dict, {})
+    assert scd_type_2_model.kind == _model_kind_validator(None, model_kind_dict, None)
 
 
 def test_scd_type_2_python_model() -> None:
@@ -5500,7 +5500,7 @@ def test_incremental_by_partition(sushi_context, assert_exp_eq):
     )
     model = load_sql_based_model(expressions)
     assert model.kind.is_incremental_by_partition
-    assert model.kind.disable_restatement
+    assert not model.kind.disable_restatement
 
     expressions = d.parse(
         """
@@ -5848,7 +5848,7 @@ on_destructive_change 'ERROR'
         .sql()
         == """INCREMENTAL_BY_PARTITION (
 forward_only TRUE,
-disable_restatement TRUE,
+disable_restatement FALSE,
 on_destructive_change 'ERROR'
 )"""
     )
@@ -6207,7 +6207,6 @@ def test_macro_func_hash(mocker: MockerFixture, metadata_only: bool):
         assert model.metadata_hash != new_model.metadata_hash
     else:
         assert "noop" in new_model._data_hash_values[0]
-        assert not new_model._additional_metadata
         assert model.data_hash != new_model.data_hash
         assert model.metadata_hash == new_model.metadata_hash
 

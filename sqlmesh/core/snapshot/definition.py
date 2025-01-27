@@ -25,8 +25,8 @@ from sqlmesh.utils.date import (
     TimeLike,
     is_date,
     make_inclusive,
-    make_inclusive_end,
     make_exclusive,
+    make_inclusive_end,
     now,
     now_timestamp,
     time_like_to_str,
@@ -926,7 +926,7 @@ class Snapshot(PydanticModel, SnapshotInfoMixin):
             previous_version = self.previous_version
             self.version = previous_version.data_version.version
             self.physical_schema_ = previous_version.physical_schema
-            if category.is_indirect_non_breaking or category.is_metadata:
+            if self.is_materialized and (category.is_indirect_non_breaking or category.is_metadata):
                 # Reuse the dev table for indirect non-breaking changes.
                 self.temp_version = (
                     previous_version.data_version.temp_version
