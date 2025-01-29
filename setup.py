@@ -151,6 +151,7 @@ setup(
             "snowflake-snowpark-python; python_version<'3.12'",
         ],
         "trino": [
+            "psycopg2-binary",
             "trino",
         ],
         "web": [
