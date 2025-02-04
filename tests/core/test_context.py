@@ -26,6 +26,7 @@ from sqlmesh.core.config import (
     load_configs,
 )
 from sqlmesh.core.context import Context
+from sqlmesh.core.console import create_console
 from sqlmesh.core.dialect import parse, schema_
 from sqlmesh.core.engine_adapter.duckdb import DuckDBEngineAdapter
 from sqlmesh.core.environment import Environment
@@ -459,8 +460,7 @@ def test_override_builtin_audit_blocking_mode():
         )
     )
 
-    logger = logging.getLogger("sqlmesh.core.scheduler")
-    with patch.object(logger, "warning") as mock_logger:
+    with patch.object(context.console, "log_warning") as mock_logger:
         plan = context.plan(auto_apply=True, no_prompts=True)
         new_snapshot = next(iter(plan.context_diff.new_snapshots.values()))
 
@@ -506,6 +506,8 @@ def test_override_builtin_audit_blocking_mode():
 
 
 def test_python_model_empty_df_raises(sushi_context, capsys):
+    sushi_context.console = create_console()
+
     @model(
         "memory.sushi.test_model",
         columns={"col": "int"},
@@ -524,11 +526,8 @@ def test_python_model_empty_df_raises(sushi_context, capsys):
         sushi_context.plan(no_prompts=True, auto_apply=True)
 
     assert (
-        "Cannot construct source query from an empty \nDataFrame. This error "
-        "is commonly related to Python models that produce no data.\nFor such "
-        "models, consider yielding from an empty generator if the resulting set "
-        "\nis empty, i.e. use `yield from ()`"
-    ) in capsys.readouterr().out
+        "Cannot construct source query from an empty DataFrame. This error is commonly related to Python models that produce no data. For such models, consider yielding from an empty generator if the resulting set is empty, i.e. use"
+    ) in capsys.readouterr().out.replace("\n", "")
 
 
 def test_env_and_default_schema_normalization(mocker: MockerFixture):
@@ -1011,8 +1010,7 @@ def test_load_external_models(copy_to_temp_path):
     assert context.resolve_table("raw.demographics") == '"memory"."raw"."demographics"'
     assert context.resolve_table("raw.model2") == '"memory"."raw"."model2"'
 
-    logger = logging.getLogger("sqlmesh.core.context")
-    with patch.object(logger, "warning") as mock_logger:
+    with patch.object(context.console, "log_warning") as mock_logger:
         context.table("raw.model1") == '"memory"."raw"."model1"'
 
         assert mock_logger.mock_calls == [
@@ -1072,7 +1070,7 @@ def test_get_model_mixed_dialects(copy_to_temp_path):
     model = load_sql_based_model(expression, default_catalog=context.default_catalog)
     context.upsert_model(model)
 
-    assert context.get_model("sushi.snowflake_dialect") == model
+    assert context.get_model("sushi.snowflake_dialect").dict() == model.dict()
 
 
 def test_override_dialect_normalization_strategy():
@@ -1193,3 +1191,86 @@ def test_requirements(copy_to_temp_path: t.Callable):
     diff = context.plan_builder("dev", skip_tests=True, skip_backfill=True).build().context_diff
     assert set(diff.previous_requirements) == requirements
     assert set(diff.requirements) == {"numpy", "pandas"}
+
+
+@pytest.mark.slow
+def test_rendered_diff():
+    ctx = Context(config=Config())
+
+    ctx.upsert_model(
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name test,
+                );
+
+                CREATE TABLE IF NOT EXISTS foo AS (SELECT @OR(FALSE, TRUE));
+
+                SELECT 4 + 2;
+
+                CREATE TABLE IF NOT EXISTS foo2 AS (SELECT @AND(TRUE, FALSE));
+
+                ON_VIRTUAL_UPDATE_BEGIN;
+                DROP VIEW @this_model
+                ON_VIRTUAL_UPDATE_END;
+
+                """
+            )
+        )
+    )
+
+    ctx.plan("dev", auto_apply=True, no_prompts=True)
+
+    # Alter the model's query and pre/post/virtual statements to cause the diff
+    ctx.upsert_model(
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name test,
+                );
+
+                CREATE TABLE IF NOT EXISTS foo AS (SELECT @AND(TRUE, NULL));
+
+                SELECT 5 + 2;
+
+                CREATE TABLE IF NOT EXISTS foo2 AS (SELECT @OR(TRUE, NULL));
+
+                ON_VIRTUAL_UPDATE_BEGIN;
+                DROP VIEW IF EXISTS @this_model
+                ON_VIRTUAL_UPDATE_END;
+                """
+            )
+        )
+    )
+
+    plan = ctx.plan("dev", auto_apply=True, no_prompts=True, diff_rendered=True)
+
+    assert '''@@ -4,13 +4,13 @@
+
+ CREATE TABLE IF NOT EXISTS "foo" AS
+ (
+   SELECT
+-    FALSE OR TRUE
++    TRUE
+ )
+ SELECT
+-  6 AS "_col_0"
++  7 AS "_col_0"
+ CREATE TABLE IF NOT EXISTS "foo2" AS
+ (
+   SELECT
+-    TRUE AND FALSE
++    TRUE
+ )
+-DROP VIEW "test"
++DROP VIEW IF EXISTS "test"''' in plan.context_diff.text_diff('"test"')
+
+
+def test_plan_enable_preview_default(sushi_context: Context, sushi_dbt_context: Context):
+    assert sushi_context._plan_preview_enabled
+    assert not sushi_dbt_context._plan_preview_enabled
+
+    sushi_dbt_context.engine_adapter.SUPPORTS_CLONING = True
+    assert sushi_dbt_context._plan_preview_enabled

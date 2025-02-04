@@ -1,5 +1,7 @@
 # Tobiko Cloud: Getting Started
 
+<div style="position: relative; padding-bottom: 56.25%; height: 0;"><iframe src="https://www.loom.com/embed/bfd7da9166324b0e987c3824f824d929?sid=5d14308f-1e2c-4883-8ac0-29173a698f71" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></iframe></div>
+
 Tobiko Cloud is a data platform that extends SQLMesh to make it easy to manage data at scale without the waste.
 
 We're here to make it easy to get started and feel confident that everything is working as expected. After you've completed the steps below, you'll have achieved the following:
@@ -37,7 +39,7 @@ Technical Requirements:
 
 - Tobiko Cloud requires Python version between 3.9 and 3.12
 
-??? "Installing Python"
+!!! note
     If you don't have a supported Python version installed, you can use [uv](https://docs.astral.sh/uv/getting-started/installation/#installation-methods) to install it.
     At the time of writing, these are the suggested commands to install uv and Python:
 
@@ -104,7 +106,15 @@ First, open a terminal within your terminal/IDE (ex: VSCode). Then follow the fo
 !!! note
     You may need to run `python3` or `pip3` instead of `python` or `pip`, depending on your python installation.
 
-4. Create an alias to ensure use of `tcloud`:
+    If you do not see `tcloud` in the virtual environment path above, you may need to reactivate the venv:
+
+    ```bash
+    source .venv/bin/activate
+    which tcloud
+    # expected path: /Users/person/Desktop/git_repos/tobiko-cloud-demo/.venv/bin/tcloud
+    ```
+
+- Create an alias to ensure use of `tcloud`:
 
     We recommend using a command line alias to ensure all `sqlmesh` commands run on Tobiko Cloud.
 
@@ -214,16 +224,17 @@ Now we're ready to connect your data warehouse to Tobiko Cloud:
     cicd_bot:
       type: github
       merge_method: squash
+      skip_pr_backfill: false
       enable_deploy_command: true
       auto_categorize_changes:
-      external: full
-      python: full
-      sql: full
-      seed: full
+        external: full
+        python: full
+        sql: full
+        seed: full
 
     # preview data for forward only models
     plan:
-    enable_preview: true
+      enable_preview: true
 
     # list of users that are allowed to approve PRs for synchronized deployments
     users:
