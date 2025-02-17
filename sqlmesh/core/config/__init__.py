@@ -16,6 +16,7 @@ from sqlmesh.core.config.connection import (
     MySQLConnectionConfig as MySQLConnectionConfig,
     PostgresConnectionConfig as PostgresConnectionConfig,
     RedshiftConnectionConfig as RedshiftConnectionConfig,
+    RisingwaveConnectionConfig as RisingwaveConnectionConfig,
     SnowflakeConnectionConfig as SnowflakeConnectionConfig,
     SparkConnectionConfig as SparkConnectionConfig,
     TrinoConnectionConfig as TrinoConnectionConfig,
