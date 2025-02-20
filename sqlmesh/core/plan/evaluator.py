@@ -219,11 +219,23 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             plan: The plan to source snapshots from.
             deployability_index: Indicates which snapshots are deployable in the context of this creation.
         """
-        snapshots_to_create = [
-            s
-            for s in snapshots.values()
-            if s.is_model and not s.is_symbolic and plan.is_selected_for_backfill(s.name)
-        ]
+        promoted_snapshot_ids = (
+            set(plan.environment.promoted_snapshot_ids)
+            if plan.environment.promoted_snapshot_ids is not None
+            else None
+        )
+
+        def _should_create(s: Snapshot) -> bool:
+            if not s.is_model or s.is_symbolic:
+                return False
+            # Only create tables for snapshots that we're planning to promote or that were selected for backfill
+            return (
+                plan.is_selected_for_backfill(s.name)
+                or promoted_snapshot_ids is None
+                or s.snapshot_id in promoted_snapshot_ids
+            )
+
+        snapshots_to_create = [s for s in snapshots.values() if _should_create(s)]
 
         completed = False
         progress_stopped = False
@@ -276,11 +288,15 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         )
 
         if not plan.is_dev:
-            self.snapshot_evaluator.migrate(
-                [s for s in snapshots.values() if s.is_paused],
-                snapshots,
-                plan.allow_destructive_models,
-            )
+            try:
+                self.snapshot_evaluator.migrate(
+                    [s for s in snapshots.values() if s.is_paused],
+                    snapshots,
+                    plan.allow_destructive_models,
+                )
+            except NodeExecutionFailedError as ex:
+                raise PlanError(str(ex.__cause__) if ex.__cause__ else str(ex))
+
             if not plan.ensure_finalized_snapshots:
                 # Only unpause at this point if we don't have to use the finalized snapshots
                 # for subsequent plan applications. Otherwise, unpause right before finalizing
@@ -393,7 +409,9 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         #
         # Without this rule, its possible that promoting a dev table to prod will introduce old data to prod
         snapshot_intervals_to_restate.update(
-            self._restatement_intervals_across_all_environments(plan.restatements)
+            self._restatement_intervals_across_all_environments(
+                plan.restatements, plan.disabled_restatement_models
+            )
         )
 
         self.state_sync.remove_intervals(
@@ -402,12 +420,12 @@ class BuiltInPlanEvaluator(PlanEvaluator):
         )
 
     def _restatement_intervals_across_all_environments(
-        self, prod_restatements: t.Dict[str, Interval]
+        self, prod_restatements: t.Dict[str, Interval], disable_restatement_models: t.Set[str]
     ) -> t.Set[t.Tuple[SnapshotTableInfo, Interval]]:
         """
         Given a map of snapshot names + intervals to restate in prod:
          - Look up matching snapshots across all environments (match based on name - regardless of version)
-         - For each match, also match downstream snapshots
+         - For each match, also match downstream snapshots while filtering out models that have restatement disabled
          - Return all matches mapped to the intervals of the prod snapshot being restated
 
         The goal here is to produce a list of intervals to invalidate across all environments so that a cadence
@@ -428,7 +446,11 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             for restatement, intervals in prod_restatements.items():
                 if restatement not in keyed_snapshots:
                     continue
-                affected_snapshot_names = [restatement] + env_dag.downstream(restatement)
+                affected_snapshot_names = [
+                    x
+                    for x in ([restatement] + env_dag.downstream(restatement))
+                    if x not in disable_restatement_models
+                ]
                 snapshots_to_restate.update(
                     {(keyed_snapshots[a], intervals) for a in affected_snapshot_names}
                 )

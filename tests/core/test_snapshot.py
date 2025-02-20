@@ -23,6 +23,7 @@ from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.model import (
     FullKind,
     IncrementalByTimeRangeKind,
+    IncrementalByUniqueKeyKind,
     IncrementalUnmanagedKind,
     Model,
     Seed,
@@ -61,6 +62,7 @@ from sqlmesh.utils import AttributeDict
 from sqlmesh.utils.date import DatetimeRanges, to_date, to_datetime, to_timestamp
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.jinja import JinjaMacroRegistry, MacroInfo
+from sqlmesh.core.console import get_console
 
 
 @pytest.fixture
@@ -112,6 +114,7 @@ def test_json(snapshot: Snapshot):
         "fingerprint": snapshot.fingerprint.dict(),
         "intervals": [],
         "dev_intervals": [],
+        "dev_table_suffix": "dev",
         "pending_restatement_intervals": [],
         "node": {
             "audits": [],
@@ -751,6 +754,63 @@ def test_get_removal_intervals_full_history_restatement_model(make_snapshot):
     assert interval == (to_timestamp("2023-01-01"), execution_time)
 
 
+def test_get_removal_intervals_warns_when_requested_range_automatically_widened(
+    make_snapshot: t.Callable[..., Snapshot], mocker: MockerFixture
+):
+    mock_logger = mocker.patch.object(get_console(), "log_warning")
+
+    # INCREMENTAL_BY_UNIQUE_KEY should warn
+    snapshot = make_snapshot(
+        SqlModel(
+            name="name",
+            kind=IncrementalByUniqueKeyKind(unique_key=[exp.to_column("id")]),
+            query=parse_one("select id from src"),
+        )
+    )
+
+    assert not snapshot.intervals
+    assert snapshot.full_history_restatement_only
+
+    snapshot.add_interval("2020-01-01", "2020-01-10")
+
+    # should warn if requested intervals are a subset of actual intervals and thus are automatically expanded
+    snapshot.get_removal_interval("2020-01-05", "2020-01-06")
+
+    msg = mock_logger.call_args[0][0]
+    assert "does not support partial restatement" in msg
+    assert "Expanding the requested restatement intervals" in msg
+
+    # should not warn if requested intervals are equal to actual intervals
+    mock_logger.reset_mock()
+
+    snapshot.get_removal_interval("2020-01-01", "2020-01-10")
+    mock_logger.assert_not_called()
+
+    # should not warn if requested intervals are a superset of actual intervals
+    mock_logger.reset_mock()
+
+    snapshot.get_removal_interval("2019-12-30", "2020-01-15")
+    mock_logger.assert_not_called()
+
+    # should not warn on models that support partial restatement, such as INCREMENTAL_BY_TIME_RANGE
+    mock_logger.reset_mock()
+    snapshot = make_snapshot(
+        SqlModel(
+            name="name",
+            kind=IncrementalByTimeRangeKind(time_column=TimeColumn(column="ds")),
+            query=parse_one("select ds from src"),
+        )
+    )
+
+    assert not snapshot.intervals
+    assert not snapshot.full_history_restatement_only
+
+    snapshot.add_interval("2020-01-01", "2020-01-10")
+
+    snapshot.get_removal_interval("2020-01-05", "2020-01-06")
+    mock_logger.assert_not_called()
+
+
 each_macro = lambda: "test"  # noqa: E731
 
 
@@ -952,9 +1012,9 @@ def test_table_name(snapshot: Snapshot, make_snapshot: t.Callable):
     snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
     snapshot.previous_versions = ()
     assert snapshot.table_name(is_deployable=True) == "sqlmesh__default.name__3078928823"
-    assert snapshot.table_name(is_deployable=False) == "sqlmesh__default.name__3078928823__temp"
+    assert snapshot.table_name(is_deployable=False) == "sqlmesh__default.name__3078928823__dev"
 
-    assert not snapshot.temp_version
+    assert not snapshot.dev_version
 
     # Mimic an indirect non-breaking change.
     previous_data_version = snapshot.data_version
@@ -966,8 +1026,8 @@ def test_table_name(snapshot: Snapshot, make_snapshot: t.Callable):
     snapshot.categorize_as(SnapshotChangeCategory.INDIRECT_NON_BREAKING)
     assert snapshot.table_name(is_deployable=True) == "sqlmesh__default.name__3078928823"
     # Indirect non-breaking snapshots reuse the dev table as well.
-    assert snapshot.table_name(is_deployable=False) == "sqlmesh__default.name__3078928823__temp"
-    assert snapshot.temp_version
+    assert snapshot.table_name(is_deployable=False) == "sqlmesh__default.name__3078928823__dev"
+    assert snapshot.dev_version
 
     # Mimic a direct forward-only change.
     snapshot.fingerprint = SnapshotFingerprint(
@@ -976,7 +1036,7 @@ def test_table_name(snapshot: Snapshot, make_snapshot: t.Callable):
     snapshot.previous_versions = (previous_data_version,)
     snapshot.categorize_as(SnapshotChangeCategory.FORWARD_ONLY)
     assert snapshot.table_name(is_deployable=True) == "sqlmesh__default.name__3078928823"
-    assert snapshot.table_name(is_deployable=False) == "sqlmesh__default.name__3049392110__temp"
+    assert snapshot.table_name(is_deployable=False) == "sqlmesh__default.name__3049392110__dev"
 
     fully_qualified_snapshot = make_snapshot(
         SqlModel(name='"my-catalog".db.table', query=parse_one("select 1, ds"))
@@ -1006,10 +1066,10 @@ def test_table_name_view(make_snapshot: t.Callable):
     assert snapshot.table_name(is_deployable=True) == f"sqlmesh__default.name__{snapshot.version}"
     assert (
         snapshot.table_name(is_deployable=False)
-        == f"sqlmesh__default.name__{snapshot.temp_version_get_or_generate()}__temp"
+        == f"sqlmesh__default.name__{snapshot.dev_version_get_or_generate()}__dev"
     )
 
-    assert not snapshot.temp_version
+    assert not snapshot.dev_version
 
     # Mimic an indirect non-breaking change.
     new_snapshot = make_snapshot(SqlModel(name="name", query=parse_one("select 2"), kind="VIEW"))
@@ -1022,11 +1082,11 @@ def test_table_name_view(make_snapshot: t.Callable):
     # Indirect non-breaking view snapshots should not reuse the dev table.
     assert (
         new_snapshot.table_name(is_deployable=False)
-        == f"sqlmesh__default.name__{new_snapshot.temp_version_get_or_generate()}__temp"
+        == f"sqlmesh__default.name__{new_snapshot.dev_version_get_or_generate()}__dev"
     )
-    assert not new_snapshot.temp_version
+    assert not new_snapshot.dev_version
     assert new_snapshot.version == snapshot.version
-    assert new_snapshot.temp_version_get_or_generate() != snapshot.temp_version_get_or_generate()
+    assert new_snapshot.dev_version_get_or_generate() != snapshot.dev_version_get_or_generate()
 
 
 def test_categorize_change_sql(make_snapshot):
@@ -1643,6 +1703,15 @@ def test_qualified_view_name(qualified_view_name, environment_naming_info, expec
     assert qualified_view_name.for_environment(environment_naming_info) == expected
 
 
+def test_qualified_view_name_with_dialect():
+    qualified_view_name = QualifiedViewName(catalog="catalog", schema_name="db", table="table")
+    environment_naming_info = EnvironmentNamingInfo(name="dev", catalog_name_override="override")
+    assert (
+        qualified_view_name.for_environment(environment_naming_info, dialect="snowflake")
+        == "OVERRIDE.db__DEV.table"
+    )
+
+
 def test_multi_interval_merge(make_snapshot):
     a = make_snapshot(
         SqlModel(
@@ -1913,30 +1982,34 @@ def test_deployability_index_missing_parent(make_snapshot):
 
 
 @pytest.mark.parametrize(
-    "model_name, environment_naming_info, default_catalog, expected",
+    "model_name, environment_naming_info, default_catalog, dialect, expected",
     (
         (
             "test_db.test_model",
             EnvironmentNamingInfo(),
             None,
+            "duckdb",
             "test_db.test_model",
         ),
         (
             "test_db.test_model",
             EnvironmentNamingInfo(name="dev"),
             None,
+            "duckdb",
             "test_db__dev.test_model",
         ),
         (
             "test_db.test_model",
             EnvironmentNamingInfo(name="dev", suffix_target=EnvironmentSuffixTarget.SCHEMA),
             None,
+            "duckdb",
             "test_db__dev.test_model",
         ),
         (
             "test_db.test_model",
             EnvironmentNamingInfo(name="dev", suffix_target=EnvironmentSuffixTarget.TABLE),
             None,
+            "duckdb",
             "test_db.test_model__dev",
         ),
         (
@@ -1947,12 +2020,14 @@ def test_deployability_index_missing_parent(make_snapshot):
                 catalog_name_override="catalog_override",
             ),
             None,
+            "duckdb",
             "catalog_override.test_db.test_model__dev",
         ),
         (
             "original_catalog.test_db.test_model",
             EnvironmentNamingInfo(name="dev", suffix_target=EnvironmentSuffixTarget.TABLE),
             "default_catalog",
+            "duckdb",
             "original_catalog.test_db.test_model__dev",
         ),
         (
@@ -1963,6 +2038,7 @@ def test_deployability_index_missing_parent(make_snapshot):
                 catalog_name_override="catalog_override",
             ),
             "default_catalog",
+            "duckdb",
             "catalog_override.test_db.test_model__dev",
         ),
         (
@@ -1973,18 +2049,31 @@ def test_deployability_index_missing_parent(make_snapshot):
                 catalog_name_override="catalog_override",
             ),
             "default_catalog",
+            "duckdb",
             "catalog_override.test_db.test_model__dev",
         ),
         (
             "test_db.test_model",
             EnvironmentNamingInfo(name="dev", suffix_target=EnvironmentSuffixTarget.TABLE),
             "default_catalog",
+            "duckdb",
             "test_db.test_model__dev",
+        ),
+        (
+            "test_db.test_model",
+            EnvironmentNamingInfo(
+                name="dev",
+                suffix_target=EnvironmentSuffixTarget.TABLE,
+                catalog_name_override="catalog_override",
+            ),
+            "default_catalog",
+            "snowflake",
+            "CATALOG_OVERRIDE.test_db.test_model__DEV",
         ),
     ),
 )
 def test_display_name(
-    make_snapshot, model_name, environment_naming_info, default_catalog, expected
+    make_snapshot, model_name, environment_naming_info, default_catalog, dialect, expected
 ):
     input_model = SqlModel(
         name=model_name,
@@ -1993,7 +2082,10 @@ def test_display_name(
         default_catalog=default_catalog,
     )
     input_snapshot = make_snapshot(input_model)
-    assert display_name(input_snapshot, environment_naming_info, default_catalog) == expected
+    assert (
+        display_name(input_snapshot, environment_naming_info, default_catalog, dialect=dialect)
+        == expected
+    )
 
 
 def test_missing_intervals_node_start_end(make_snapshot):
@@ -2197,11 +2289,10 @@ def test_missing_intervals_interval_end_per_model(make_snapshot):
             snapshot_a.name: to_timestamp("2023-01-09"),
             snapshot_b.name: to_timestamp(
                 "2023-01-06"
-            ),  # The interval end is before the start. This should be ignored.
+            ),  # The interval end is before the start. The snapshot will be skipped
         },
     ) == {
         snapshot_a: [(to_timestamp("2023-01-08"), to_timestamp("2023-01-09"))],
-        snapshot_b: [(to_timestamp("2023-01-08"), to_timestamp("2023-01-09"))],
     }
 
 
@@ -2325,7 +2416,7 @@ def test_contiguous_intervals():
 
 def test_check_ready_intervals(mocker: MockerFixture):
     def assert_always_signal(intervals):
-        _check_ready_intervals(lambda _: True, intervals) == intervals
+        assert _check_ready_intervals(lambda _: True, intervals) == intervals
 
     assert_always_signal([])
     assert_always_signal([(0, 1)])
@@ -2333,12 +2424,20 @@ def test_check_ready_intervals(mocker: MockerFixture):
     assert_always_signal([(0, 1), (2, 3)])
 
     def assert_never_signal(intervals):
-        _check_ready_intervals(lambda _: False, intervals) == []
+        assert _check_ready_intervals(lambda _: False, intervals) == []
 
     assert_never_signal([])
     assert_never_signal([(0, 1)])
     assert_never_signal([(0, 1), (1, 2)])
     assert_never_signal([(0, 1), (2, 3)])
+
+    def assert_empty_signal(intervals):
+        assert _check_ready_intervals(lambda _: [], intervals) == []
+
+    assert_empty_signal([])
+    assert_empty_signal([(0, 1)])
+    assert_empty_signal([(0, 1), (1, 2)])
+    assert_empty_signal([(0, 1), (2, 3)])
 
     def to_intervals(values: t.List[t.Tuple[int, int]]) -> DatetimeRanges:
         return [(to_datetime(s), to_datetime(e)) for s, e in values]

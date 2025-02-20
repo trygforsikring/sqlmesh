@@ -2,7 +2,7 @@
 
 Tobiko Cloud's Dagster integration allows you to combine Dagster system monitoring with the powerful debugging tools in Tobiko Cloud.
 
-![Dagster UI Asset Lineage](./dagster/asset_lineage.png)
+<div style="position: relative; padding-bottom: 55.27756059421422%; height: 0;"><iframe src="https://www.loom.com/embed/18492cf6d4f94eab9f178bae7539d2ab?sid=c4f7b616-16bc-4964-985c-4f4bb5052a6d" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></iframe></div>
 
 ## How it works
 
@@ -35,13 +35,20 @@ After connecting your project to Tobiko Cloud, you're ready to set up the Dagste
 
 First, navigate to your Dagster project or [create a new one](https://docs.dagster.io/guides/build/projects/creating-a-new-project).
 
-Next, add the `tobiko-cloud-scheduler-facade` library to the `install_requires` section of your [Dagster project](https://docs.dagster.io/guides/understanding-dagster-project-files)'s `setup.py`:
+Next, add the `tobiko-cloud-scheduler-facade` library to the `dependencies` section of your [Dagster project](https://docs.dagster.io/guides/understanding-dagster-project-files)'s `pyproject.toml`:
 
-```python title="setup.py" hl_lines="3"
-install_requires=[
+```python title="pyproject.toml" hl_lines="4"
+[project]
+dependencies = [
     "dagster",
     "tobiko-cloud-scheduler-facade[dagster]"
 ],
+```
+
+And then install it into the Python environment used by your Dagster project:
+
+```sh
+$ pip install -e '.[dev]'
 ```
 
 ### Connect Dagster to Tobiko Cloud

@@ -6,6 +6,7 @@ import typing as t
 import unittest
 import uuid
 import logging
+import textwrap
 
 from hyperscript import h
 from rich.console import Console as RichConsole
@@ -35,11 +36,16 @@ from sqlmesh.core.test import ModelTest
 from sqlmesh.utils import rich as srich
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
 from sqlmesh.utils.date import time_like_to_str, to_date, yesterday_ds
-from sqlmesh.utils.errors import PythonModelEvalError
+from sqlmesh.utils.errors import (
+    PythonModelEvalError,
+    NodeAuditsErrors,
+    format_destructive_change_msg,
+)
 
 if t.TYPE_CHECKING:
     import ipywidgets as widgets
 
+    from sqlglot import exp
     from sqlglot.dialects.dialect import DialectType
     from sqlmesh.core.context_diff import ContextDiff
     from sqlmesh.core.plan import Plan, EvaluatablePlan, PlanBuilder, SnapshotIntervals
@@ -60,6 +66,9 @@ SNAPSHOT_CHANGE_CATEGORY_STR = {
     SnapshotChangeCategory.INDIRECT_NON_BREAKING: "Indirect Non-breaking",
     SnapshotChangeCategory.METADATA: "Metadata",
 }
+
+PROGRESS_BAR_WIDTH = 40
+LINE_WRAP_WIDTH = 100
 
 
 class Console(abc.ABC):
@@ -246,12 +255,28 @@ class Console(abc.ABC):
         """Display list of models that failed during evaluation to the user."""
 
     @abc.abstractmethod
+    def log_destructive_change(
+        self,
+        snapshot_name: str,
+        dropped_column_names: t.List[str],
+        alter_expressions: t.List[exp.Alter],
+        dialect: str,
+        error: bool = True,
+    ) -> None:
+        """Display a destructive change error or warning to the user."""
+
+    @abc.abstractmethod
     def log_error(self, message: str) -> None:
         """Display error info to the user."""
 
     @abc.abstractmethod
-    def log_warning(self, message: str) -> None:
-        """Display warning info to the user."""
+    def log_warning(self, short_message: str, long_message: t.Optional[str] = None) -> None:
+        """Display warning info to the user.
+
+        Args:
+            short_message: The warning message to print to console.
+            long_message: The warning message to log to file. If not provided, `short_message` is used.
+        """
 
     @abc.abstractmethod
     def log_success(self, message: str) -> None:
@@ -409,11 +434,21 @@ class NoopConsole(Console):
     def log_failed_models(self, errors: t.List[NodeExecutionFailedError]) -> None:
         pass
 
+    def log_destructive_change(
+        self,
+        snapshot_name: str,
+        dropped_column_names: t.List[str],
+        alter_expressions: t.List[exp.Alter],
+        dialect: str,
+        error: bool = True,
+    ) -> None:
+        pass
+
     def log_error(self, message: str) -> None:
         pass
 
-    def log_warning(self, message: str) -> None:
-        logger.warning(message)
+    def log_warning(self, short_message: str, long_message: t.Optional[str] = None) -> None:
+        logger.warning(long_message or short_message)
 
     def log_success(self, message: str) -> None:
         pass
@@ -436,7 +471,7 @@ class NoopConsole(Console):
 def make_progress_bar(message: str, console: t.Optional[RichConsole] = None) -> Progress:
     return Progress(
         TextColumn(f"[bold blue]{message}", justify="right"),
-        BarColumn(bar_width=40),
+        BarColumn(bar_width=PROGRESS_BAR_WIDTH),
         "[progress.percentage]{task.percentage:>3.1f}%",
         "•",
         srich.BatchColumn(),
@@ -668,7 +703,7 @@ class TerminalConsole(Console):
                     f"[bold blue]Virtually Updating '{environment_naming_info.name}'",
                     justify="right",
                 ),
-                BarColumn(bar_width=40),
+                BarColumn(bar_width=PROGRESS_BAR_WIDTH),
                 "[progress.percentage]{task.percentage:>3.1f}%",
                 "•",
                 TimeElapsedColumn(),
@@ -930,7 +965,8 @@ class TerminalConsole(Console):
                     )
                 elif context_diff.indirectly_modified(name):
                     indirect.add(f"[indirect]{display_name}")
-                elif context_diff.metadata_updated(name):
+
+                if context_diff.metadata_updated(name):
                     metadata.add(
                         f"[metadata]{display_name}"
                         if no_diff
@@ -1024,7 +1060,7 @@ class TerminalConsole(Console):
             if context_diff.directly_modified(snapshot.name):
                 category_str = SNAPSHOT_CHANGE_CATEGORY_STR[snapshot.change_category]
                 tree = Tree(
-                    f"[bold][direct]Directly Modified: {snapshot.display_name(plan.environment_naming_info, default_catalog, dialect=self.dialect)} ({category_str})"
+                    f"\n[bold][direct]Directly Modified: {snapshot.display_name(plan.environment_naming_info, default_catalog, dialect=self.dialect)} ({category_str})"
                 )
                 indirect_tree = None
                 for child_sid in sorted(plan.indirectly_modified.get(snapshot.snapshot_id, set())):
@@ -1042,20 +1078,23 @@ class TerminalConsole(Console):
                     indirect_tree = self._limit_model_names(indirect_tree, self.verbose)
             elif context_diff.metadata_updated(snapshot.name):
                 tree = Tree(
-                    f"[bold][metadata]Metadata Updated: {snapshot.display_name(plan.environment_naming_info, default_catalog, dialect=self.dialect)}"
+                    f"\n[bold][metadata]Metadata Updated: {snapshot.display_name(plan.environment_naming_info, default_catalog, dialect=self.dialect)}"
                 )
             else:
                 continue
 
-            self._print(Syntax(context_diff.text_diff(snapshot.name), "sql", word_wrap=True))
-            self._print(tree)
+            text_diff = context_diff.text_diff(snapshot.name)
+            if text_diff:
+                self._print("")
+                self._print(Syntax(text_diff, "sql", word_wrap=True))
+                self._print(tree)
 
     def _show_missing_dates(self, plan: Plan, default_catalog: t.Optional[str]) -> None:
         """Displays the models with missing dates."""
         missing_intervals = plan.missing_intervals
         if not missing_intervals:
             return
-        backfill = Tree("[bold]Models needing backfill \\[missing dates]:")
+        backfill = Tree("[bold]Models needing backfill:[/bold]")
         for missing in missing_intervals:
             snapshot = plan.context_diff.snapshots[missing.snapshot_id]
             if not snapshot.is_model:
@@ -1183,13 +1222,44 @@ class TerminalConsole(Console):
             for node_name, msg in error_messages.items():
                 self._print(f"  [red]{node_name}[/red]\n\n{msg}")
 
+    def log_destructive_change(
+        self,
+        snapshot_name: str,
+        dropped_column_names: t.List[str],
+        alter_expressions: t.List[exp.Alter],
+        dialect: str,
+        error: bool = True,
+    ) -> None:
+        if error:
+            self._print(
+                format_destructive_change_msg(
+                    snapshot_name, dropped_column_names, alter_expressions, dialect
+                )
+            )
+        else:
+            self.log_warning(
+                format_destructive_change_msg(
+                    snapshot_name, dropped_column_names, alter_expressions, dialect, error
+                )
+            )
+
     def log_error(self, message: str) -> None:
         self._print(f"[red]{message}[/red]")
 
-    def log_warning(self, message: str) -> None:
-        logger.warning(message)
+    def log_warning(self, short_message: str, long_message: t.Optional[str] = None) -> None:
+        logger.warning(long_message or short_message)
         if not self.ignore_warnings:
-            self._print(f"[yellow]{message}[/yellow]")
+            if long_message:
+                for handler in logger.root.handlers:
+                    if isinstance(handler, logging.FileHandler):
+                        file_path = handler.baseFilename
+                        break
+                file_path_msg = f" Learn more in logs: {file_path}\n" if file_path else ""
+                short_message = f"{short_message}{file_path_msg}"
+            message_lstrip = short_message.lstrip()
+            leading_ws = short_message[: -len(message_lstrip)]
+            message_formatted = f"{leading_ws}[yellow]\\[WARNING] {message_lstrip}[/yellow]"
+            self._print(message_formatted)
 
     def log_success(self, message: str) -> None:
         self._print(f"\n[green]{message}[/green]\n")
@@ -1297,12 +1367,12 @@ class TerminalConsole(Console):
                 columns: dict[str, list[str]] = {}
                 source_prefix, source_name = (
                     (f"{source_name}__", source_name)
-                    if source_name != row_diff.source
+                    if source_name.lower() != row_diff.source.lower()
                     else ("s__", "SOURCE")
                 )
                 target_prefix, target_name = (
                     (f"{target_name}__", target_name)
-                    if target_name != row_diff.target
+                    if target_name.lower() != row_diff.target.lower()
                     else ("t__", "TARGET")
                 )
 
@@ -1923,7 +1993,7 @@ class MarkdownConsole(CaptureTerminalConsole):
         missing_intervals = plan.missing_intervals
         if not missing_intervals:
             return
-        self._print("\n**Models needing backfill \\[missing dates]:**")
+        self._print("\n**Models needing backfill:**")
         snapshots = []
         for missing in missing_intervals:
             snapshot = plan.context_diff.snapshots[missing.snapshot_id]
@@ -2020,8 +2090,9 @@ class MarkdownConsole(CaptureTerminalConsole):
     def log_error(self, message: str) -> None:
         super().log_error(f"```\n\\[ERROR] {message}```\n\n")
 
-    def log_warning(self, message: str) -> None:
-        super().log_warning(f"```\n\\[WARNING] {message}```\n\n")
+    def log_warning(self, short_message: str, long_message: t.Optional[str] = None) -> None:
+        logger.warning(long_message or short_message)
+        self._print(f"```\n\\[WARNING] {short_message}```\n\n")
 
 
 class DatabricksMagicConsole(CaptureTerminalConsole):
@@ -2315,10 +2386,10 @@ class DebuggerTerminalConsole(TerminalConsole):
     def log_error(self, message: str) -> None:
         self._write(message, style="bold red")
 
-    def log_warning(self, message: str) -> None:
-        logger.warning(message)
+    def log_warning(self, short_message: str, long_message: t.Optional[str] = None) -> None:
+        logger.warning(long_message or short_message)
         if not self.ignore_warnings:
-            self._write(message, style="bold yellow")
+            self._write(short_message, style="bold yellow")
 
     def log_success(self, message: str) -> None:
         self._write(message, style="bold green")
@@ -2405,9 +2476,13 @@ def _format_node_errors(errors: t.List[NodeExecutionFailedError]) -> t.Dict[str,
 
         error_msg = str(cause)
 
-        if not isinstance(cause, (NodeExecutionFailedError, PythonModelEvalError)):
+        if isinstance(cause, NodeAuditsErrors):
+            error_msg = _format_audits_errors(cause)
+        elif not isinstance(cause, (NodeExecutionFailedError, PythonModelEvalError)):
             error_msg = "  " + error_msg.replace("\n", "\n  ")
-            error_msg = f"  {cause.__class__.__name__}:\n{error_msg}"
+            error_msg = (
+                f"  {cause.__class__.__name__}:\n{error_msg}"  # include error class name in msg
+            )
         error_msg = error_msg.replace("\n", "\n  ")
         error_msg = error_msg + "\n" if not error_msg.rstrip(" ").endswith("\n") else error_msg
 
@@ -2431,3 +2506,20 @@ def _format_node_errors(errors: t.List[NodeExecutionFailedError]) -> t.Dict[str,
         error_messages[node_name] = msg
 
     return error_messages
+
+
+def _format_audits_errors(error: NodeAuditsErrors) -> str:
+    error_messages = []
+    for err in error.errors:
+        audit_args_sql = []
+        for arg_name, arg_value in err.audit_args.items():
+            audit_args_sql.append(f"{arg_name} := {arg_value.sql(dialect=err.adapter_dialect)}")
+        audit_args_sql_msg = ("\n".join(audit_args_sql) + "\n\n") if audit_args_sql else ""
+
+        err_msg = f"'{err.audit_name}' audit error: {err.count} {'row' if err.count == 1 else 'rows'} failed"
+
+        query = "\n  ".join(textwrap.wrap(err.sql(err.adapter_dialect), width=LINE_WRAP_WIDTH))
+        msg = f"{err_msg}\n\nAudit arguments\n  {audit_args_sql_msg}Audit query\n  {query}\n\n"
+        msg = msg.replace("\n", "\n  ")
+        error_messages.append(msg)
+    return "  " + "\n".join(error_messages)

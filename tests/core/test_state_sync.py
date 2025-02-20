@@ -880,11 +880,23 @@ def test_promote_environment_expired(state_sync: EngineAdapterStateSync, make_sn
         end_at="2022-01-01",
         plan_id="new_plan_id",
         previous_plan_id=None,  # No previous plan ID since it's technically a new environment
+        expiration_ts=now_timestamp() + 3600,
     )
+    assert new_environment.expiration_ts
 
     # This call shouldn't fail.
     promotion_result = state_sync.promote(new_environment)
     assert promotion_result.added == [snapshot.table_info]
+    assert promotion_result.removed == []
+    assert promotion_result.removed_environment_naming_info is None
+
+    state_sync.finalize(new_environment)
+
+    new_environment.previous_plan_id = new_environment.plan_id
+    new_environment.plan_id = "another_plan_id"
+    promotion_result = state_sync.promote(new_environment)
+    #  Should be empty since the environment is no longer expired and nothing has changed
+    assert promotion_result.added == []
     assert promotion_result.removed == []
     assert promotion_result.removed_environment_naming_info is None
 
@@ -1295,7 +1307,7 @@ def test_delete_expired_snapshots_shared_dev_table(
     new_snapshot.ttl = "in 10 seconds"
     new_snapshot.categorize_as(SnapshotChangeCategory.FORWARD_ONLY)
     new_snapshot.version = snapshot.version
-    new_snapshot.temp_version = snapshot.temp_version_get_or_generate()
+    new_snapshot.dev_version = snapshot.dev_version_get_or_generate()
     new_snapshot.updated_ts = now_ts - 5000
 
     all_snapshots = [snapshot, new_snapshot]
@@ -2842,3 +2854,56 @@ def test_compact_intervals_pending_restatement_shared_version(
         assert snapshots[snapshot_b.snapshot_id].intervals == [
             (to_timestamp("2020-01-01"), to_timestamp("2020-01-06")),
         ]
+
+
+@time_machine.travel("2020-01-05 00:00:00 UTC")
+def test_compact_intervals_pending_restatement_many_snapshots_same_version(
+    state_sync: EngineAdapterStateSync,
+    make_snapshot: t.Callable,
+    get_snapshot_intervals: t.Callable,
+) -> None:
+    snapshots = [
+        make_snapshot(
+            SqlModel(
+                name="a",
+                cron="@daily",
+                query=parse_one(f"select {i}, ds"),
+            ),
+            version="a",
+        )
+        for i in range(100)
+    ]
+
+    state_sync.push_snapshots(snapshots)
+
+    for snapshot in snapshots:
+        state_sync.add_interval(snapshot, "2020-01-01", "2020-01-01")
+        state_sync.add_interval(snapshot, "2020-01-02", "2020-01-02")
+        state_sync.add_interval(snapshot, "2020-01-03", "2020-01-03")
+        state_sync.add_interval(snapshot, "2020-01-04", "2020-01-04")
+
+    pending_restatement_intervals = [
+        (to_timestamp("2020-01-03"), to_timestamp("2020-01-05")),
+    ]
+    state_sync.add_snapshots_intervals(
+        [
+            SnapshotIntervals(
+                name=snapshots[0].name,
+                identifier=snapshots[0].identifier,
+                version=snapshots[0].version,
+                intervals=[],
+                dev_intervals=[],
+                pending_restatement_intervals=pending_restatement_intervals,
+            )
+        ]
+    )
+
+    # Because of the number of snapshots requiring compaction, some compacted records will have different creation
+    # timestamps.
+    state_sync.compact_intervals()
+
+    assert state_sync.get_snapshots([snapshots[0].snapshot_id])[
+        snapshots[0].snapshot_id
+    ].pending_restatement_intervals == [
+        (to_timestamp("2020-01-03"), to_timestamp("2020-01-05")),
+    ]

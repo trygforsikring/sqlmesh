@@ -411,6 +411,7 @@ def make_snapshot_on_destructive_change(make_snapshot: t.Callable) -> t.Callable
                 ),
                 version="test_version",
                 change_category=SnapshotChangeCategory.FORWARD_ONLY,
+                dev_table_suffix="dev",
             ),
         )
 
@@ -440,6 +441,7 @@ def make_mocked_engine_adapter(mocker: MockerFixture) -> t.Callable:
         klass: t.Type[T],
         dialect: t.Optional[str] = None,
         register_comments: bool = True,
+        default_catalog: t.Optional[str] = None,
         **kwargs: t.Any,
     ) -> T:
         connection_mock = mocker.NonCallableMock()
@@ -450,6 +452,7 @@ def make_mocked_engine_adapter(mocker: MockerFixture) -> t.Callable:
             lambda: connection_mock,
             dialect=dialect or klass.DIALECT,
             register_comments=register_comments,
+            default_catalog=default_catalog,
             **kwargs,
         )
         if isinstance(adapter, SparkEngineAdapter):

@@ -464,15 +464,7 @@ def test_override_builtin_audit_blocking_mode():
         plan = context.plan(auto_apply=True, no_prompts=True)
         new_snapshot = next(iter(plan.context_diff.new_snapshots.values()))
 
-        version = new_snapshot.fingerprint.to_version()
-        assert mock_logger.mock_calls == [
-            call(
-                "Audit 'not_null' for model 'db.x' failed.\n"
-                "Got 1 results, expected 0.\n"
-                f'SELECT * FROM (SELECT * FROM "sqlmesh__db"."db__x__{version}" AS "db__x__{version}") AS "_q_0" WHERE "c" IS NULL AND TRUE\n'
-                "Audit is non-blocking so proceeding with execution."
-            )
-        ]
+        assert mock_logger.call_args_list[0][0][0] == "\n'not_null' audit error: 1 row failed."
 
     # Even though there are two builtin audits referenced in the above definition, we only
     # store the one that overrides `blocking` in the snapshot; the other one isn't needed
@@ -821,7 +813,7 @@ def test_janitor(sushi_context, mocker: MockerFixture) -> None:
     )
     # Assert that the views are dropped for each snapshot just once and make sure that the name used is the
     # view name with the environment as a suffix
-    assert adapter_mock.drop_view.call_count == 13
+    assert adapter_mock.drop_view.call_count == 14
     adapter_mock.drop_view.assert_has_calls(
         [
             call(
@@ -1052,6 +1044,27 @@ def test_disabled_model(copy_to_temp_path):
 
     assert (path[0] / "models" / "disabled.py").exists()
     assert not context.get_model("sushi.disabled_py")
+
+
+def test_disabled_model_python_macro(sushi_context):
+    @model(
+        "memory.sushi.disabled_model_2",
+        columns={"col": "int"},
+        enabled="@IF(@gateway = 'dev', True, False)",
+    )
+    def entrypoint(context, **kwargs):
+        yield pd.DataFrame({"col": []})
+
+    test_model = model.get_registry()["memory.sushi.disabled_model_2"].model(
+        module_path=Path("."), path=Path("."), variables={"gateway": "prod"}
+    )
+    assert not test_model.enabled
+
+    with pytest.raises(
+        SQLMeshError,
+        match="The disabled model 'memory.sushi.disabled_model_2' cannot be upserted",
+    ):
+        sushi_context.upsert_model(test_model)
 
 
 def test_get_model_mixed_dialects(copy_to_temp_path):
@@ -1286,3 +1299,71 @@ def test_catalog_name_needs_to_be_quoted():
     context.upsert_model(load_sql_based_model(parsed_model, default_catalog='"foo--bar"'))
     context.plan(auto_apply=True, no_prompts=True)
     assert context.fetchdf('select * from "foo--bar".db.x').to_dict() == {"c": {0: 1}}
+
+
+def test_plan_runs_audits_on_dev_previews(sushi_context: Context, capsys, caplog):
+    sushi_context.console = create_console()
+
+    test_model = """
+    MODEL (
+        name sushi.test_audit_model,
+        kind INCREMENTAL_BY_TIME_RANGE (
+            time_column event_date,
+            forward_only true
+        ),
+        audits (
+            number_of_rows(threshold := 10),
+            not_null(columns := id),
+            at_least_one_non_blocking(column := waiter_id)
+        )
+    );
+
+    SELECT * FROM sushi.orders WHERE event_date BETWEEN @start_ts AND @end_ts
+    """
+
+    sushi_context.upsert_model(
+        load_sql_based_model(parse(test_model), default_catalog=sushi_context.default_catalog)
+    )
+    plan = sushi_context.plan(auto_apply=True)
+
+    assert plan.new_snapshots[0].name == '"memory"."sushi"."test_audit_model"'
+    assert plan.deployability_index.is_deployable(plan.new_snapshots[0])
+
+    # now, we mutate the model and run a plan in dev to create a dev preview
+    test_model = """
+    MODEL (
+        name sushi.test_audit_model,
+        kind INCREMENTAL_BY_TIME_RANGE (
+            time_column event_date,
+            forward_only true
+        ),
+        audits (
+            not_null(columns := new_col),
+            at_least_one_non_blocking(column := new_col)
+        )
+    );
+
+    SELECT *, null as new_col FROM sushi.orders WHERE event_date BETWEEN @start_ts AND @end_ts
+    """
+
+    sushi_context.upsert_model(
+        load_sql_based_model(parse(test_model), default_catalog=sushi_context.default_catalog)
+    )
+
+    capsys.readouterr()  # clear output buffer
+    plan = sushi_context.plan(environment="dev", auto_apply=True)
+
+    assert len(plan.new_snapshots) == 1
+    dev_preview = plan.new_snapshots[0]
+    assert dev_preview.name == '"memory"."sushi"."test_audit_model"'
+    assert dev_preview.is_forward_only
+    assert not plan.deployability_index.is_deployable(
+        dev_preview
+    )  # if something is not deployable to prod, then its by definiton a dev preview
+
+    # we only see audit results if they fail
+    stdout = capsys.readouterr().out
+    log = caplog.text
+    assert "'not_null' audit error:" in log
+    assert "'at_least_one_non_blocking' audit error:" in log
+    assert "Target environment updated successfully" in stdout

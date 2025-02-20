@@ -77,6 +77,7 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
         removed_snapshots=[],
         requires_backfill=True,
         models_to_backfill={'"test_model"'},
+        disabled_restatement_models=set(),
     )
 
     client = AirflowClient(airflow_url=common.AIRFLOW_LOCAL_URL, session=requests.Session())
@@ -98,6 +99,7 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                     "fingerprint": snapshot.fingerprint.dict(),
                     "intervals": [],
                     "dev_intervals": [],
+                    "dev_table_suffix": "dev",
                     "pending_restatement_intervals": [],
                     "node": {
                         "audits": [],
@@ -160,6 +162,7 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                         "change_category": snapshot.change_category,
                         "parents": [],
                         "kind_name": "INCREMENTAL_BY_TIME_RANGE",
+                        "dev_table_suffix": "dev",
                     }
                 ],
                 "start_at": "2022-01-01",
@@ -194,6 +197,7 @@ def test_apply_plan(mocker: MockerFixture, snapshot: Snapshot):
                 '"test_model"': [to_timestamp("2024-01-01"), to_timestamp("2024-01-02")]
             },
             "requires_backfill": True,
+            "disabled_restatement_models": [],
         },
         "notification_targets": [],
         "backfill_concurrent_tasks": 1,

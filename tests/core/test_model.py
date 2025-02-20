@@ -5,13 +5,14 @@ from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch, PropertyMock
 
+import time_machine
 import pandas as pd
 import pytest
 from pytest_mock.plugin import MockerFixture
 from sqlglot import exp, parse_one
 from sqlglot.errors import ParseError
 from sqlglot.schema import MappingSchema
-from sqlmesh.cli.example_project import init_example_project
+from sqlmesh.cli.example_project import init_example_project, ProjectTemplate
 
 from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
@@ -29,6 +30,7 @@ from sqlmesh.core.dialect import parse
 from sqlmesh.core.engine_adapter.base import MERGE_SOURCE_ALIAS, MERGE_TARGET_ALIAS
 from sqlmesh.core.engine_adapter.duckdb import DuckDBEngineAdapter
 from sqlmesh.core.macros import MacroEvaluator, macro
+from sqlmesh.core import constants as c
 from sqlmesh.core.model import (
     CustomKind,
     PythonModel,
@@ -58,6 +60,7 @@ from sqlmesh.utils.date import TimeLike, to_datetime, to_ds, to_timestamp
 from sqlmesh.utils.errors import ConfigError, SQLMeshError
 from sqlmesh.utils.jinja import JinjaMacroRegistry, MacroInfo, MacroExtractor
 from sqlmesh.utils.metaprogramming import Executable
+from sqlmesh.core.macros import RuntimeStage
 
 
 def missing_schema_warning_msg(model, deps):
@@ -2435,16 +2438,16 @@ def test_model_cache(tmp_path: Path, mocker: MockerFixture):
 
     model = load_sql_based_model([e for e in expressions if e])
 
-    loader = mocker.Mock(return_value=model)
+    loader = mocker.Mock(return_value=[model])
 
-    assert cache.get_or_load("test_model", "test_entry_a", loader=loader).dict() == model.dict()
-    assert cache.get_or_load("test_model", "test_entry_a", loader=loader).dict() == model.dict()
+    assert cache.get_or_load("test_model", "test_entry_a", loader=loader)[0].dict() == model.dict()
+    assert cache.get_or_load("test_model", "test_entry_a", loader=loader)[0].dict() == model.dict()
 
-    assert cache.get_or_load("test_model", "test_entry_b", loader=loader).dict() == model.dict()
-    assert cache.get_or_load("test_model", "test_entry_b", loader=loader).dict() == model.dict()
+    assert cache.get_or_load("test_model", "test_entry_b", loader=loader)[0].dict() == model.dict()
+    assert cache.get_or_load("test_model", "test_entry_b", loader=loader)[0].dict() == model.dict()
 
-    assert cache.get_or_load("test_model", "test_entry_a", loader=loader).dict() == model.dict()
-    assert cache.get_or_load("test_model", "test_entry_a", loader=loader).dict() == model.dict()
+    assert cache.get_or_load("test_model", "test_entry_a", loader=loader)[0].dict() == model.dict()
+    assert cache.get_or_load("test_model", "test_entry_a", loader=loader)[0].dict() == model.dict()
 
     assert loader.call_count == 2
 
@@ -3395,6 +3398,12 @@ def test_project_level_properties(sushi_context):
             "target_lag": "1 hour",
         },
         virtual_properties={"creatable_type": "SECURE"},
+        enabled=False,
+        allow_partials=True,
+        interval_unit="quarter_hour",
+        validate_query=True,
+        optimize_query=True,
+        cron="@hourly",
     )
 
     model = load_sql_based_model(
@@ -3402,9 +3411,10 @@ def test_project_level_properties(sushi_context):
             """
         MODEL (
             name test_schema.test_model,
+            kind FULL,
             virtual_properties (
                 creatable_type = None
-            )
+            ),
         );
         SELECT a FROM tbl;
         """,
@@ -3412,6 +3422,14 @@ def test_project_level_properties(sushi_context):
         ),
         defaults=model_defaults.dict(),
     )
+
+    # Validate use of project wide defaults
+    assert not model.enabled
+    assert model.allow_partials
+    assert model.interval_unit == IntervalUnit.QUARTER_HOUR
+    assert model.optimize_query
+    assert model.validate_query
+    assert model.cron == "@hourly"
 
     assert model.session_properties == {
         "some_bool": False,
@@ -3426,6 +3444,73 @@ def test_project_level_properties(sushi_context):
 
     # Validate disabling global property
     assert not model.virtual_properties
+
+    model_2 = load_sql_based_model(
+        d.parse(
+            """
+        MODEL (
+            name test_schema.test_model_2,
+            kind FULL,
+            allow_partials False,
+            interval_unit hour,
+            cron '@daily'
+
+        );
+        SELECT a, b FROM tbl;
+        """,
+            default_dialect="snowflake",
+        ),
+        defaults=model_defaults.dict(),
+    )
+
+    # Validate overriding of project wide defaults
+    assert not model_2.allow_partials
+    assert model_2.interval_unit == IntervalUnit.HOUR
+    assert model_2.cron == "@daily"
+
+
+def test_project_level_properties_python_model():
+    model_defaults = {
+        "physical_properties": {
+            "partition_expiration_days": 13,
+            "creatable_type": "TRANSIENT",
+        },
+        "description": "general model description",
+        "enabled": False,
+        "allow_partials": True,
+        "interval_unit": "quarter_hour",
+        "validate_query": True,
+        "optimize_query": True,
+    }
+
+    @model(
+        name="python_model_t_defaults",
+        kind="full",
+        columns={"some_col": "int"},
+        physical_properties={"partition_expiration_days": 7},
+    )
+    def python_model_prop(context, **kwargs):
+        context.resolve_table("foo")
+
+    m = model.get_registry()["python_model_t_defaults"].model(
+        module_path=Path("."),
+        path=Path("."),
+        dialect="duckdb",
+        defaults=model_defaults,
+    )
+
+    assert m.physical_properties == {
+        "partition_expiration_days": exp.convert(7),
+        "creatable_type": exp.convert("TRANSIENT"),
+    }
+
+    # Even if in the project wide defaults these are ignored for python models
+    assert not m.optimize_query
+    assert not m.validate_query
+
+    assert not m.enabled
+    assert m.allow_partials
+    assert m.interval_unit == IntervalUnit.QUARTER_HOUR
 
 
 def test_model_session_properties(sushi_context):
@@ -4902,7 +4987,7 @@ def test_load_external_model_python(sushi_context) -> None:
 
 def test_variables_python_sql_model(mocker: MockerFixture) -> None:
     @model(
-        "test_variables_python_model",
+        "test_variables_python_model_@{bar}",
         is_sql=True,
         kind="full",
         columns={"a": "string", "b": "string", "c": "string"},
@@ -4914,12 +4999,13 @@ def test_variables_python_sql_model(mocker: MockerFixture) -> None:
             exp.convert(evaluator.var("test_var_c")).as_("c"),
         )
 
-    python_sql_model = model.get_registry()["test_variables_python_model"].model(
+    python_sql_model = model.get_registry()["test_variables_python_model_@{bar}"].model(
         module_path=Path("."),
         path=Path("."),
-        variables={"test_var_a": "test_value", "test_var_unused": 2},
+        variables={"test_var_a": "test_value", "test_var_unused": 2, "bar": "suffix"},
     )
 
+    assert python_sql_model.name == "test_variables_python_model_suffix"
     assert python_sql_model.python_env[c.SQLMESH_VARS] == Executable.value(
         {"test_var_a": "test_value"}
     )
@@ -4929,6 +5015,195 @@ def test_variables_python_sql_model(mocker: MockerFixture) -> None:
     assert (
         query.sql()
         == """SELECT 'test_value' AS "a", 'default_value' AS "b", NULL AS "c" """.strip()
+    )
+
+
+def test_macros_python_model(mocker: MockerFixture) -> None:
+    @model(
+        "foo_macro_model_@{bar}",
+        columns={"a": "string"},
+        kind=dict(name=ModelKindName.INCREMENTAL_BY_TIME_RANGE, time_column="@{time_col}"),
+        stamp="@{stamp}",
+        owner="@IF(@gateway = 'dev', @{dev_owner}, @{prod_owner})",
+        enabled="@IF(@gateway = 'dev', True, False)",
+        start="@IF(@gateway = 'dev', '1 month ago', '2024-01-01')",
+        partitioned_by=[
+            d.parse_one("DATETIME_TRUNC(@{time_col}, MONTH)"),
+        ],
+    )
+    def model_with_macros(context, **kwargs):
+        return pd.DataFrame(
+            [
+                {
+                    "a": context.var("TEST_VAR_A"),
+                }
+            ]
+        )
+
+    python_model = model.get_registry()["foo_macro_model_@{bar}"].model(
+        module_path=Path("."),
+        path=Path("."),
+        variables={
+            "test_var_a": "test_value",
+            "gateway": "prod",
+            "bar": "suffix",
+            "dev_owner": "dv_1",
+            "prod_owner": "pr_1",
+            "stamp": "bump",
+            "time_col": "a",
+        },
+    )
+
+    assert python_model.name == "foo_macro_model_suffix"
+    assert python_model.python_env[c.SQLMESH_VARS] == Executable.value({"test_var_a": "test_value"})
+    assert not python_model.enabled
+    assert python_model.start == "2024-01-01"
+    assert python_model.owner == "pr_1"
+    assert python_model.stamp == "bump"
+    assert python_model.time_column.column == exp.column("a", quoted=True)
+    assert python_model.partitioned_by[0].sql() == 'DATETIME_TRUNC("a", MONTH)'
+
+    context = ExecutionContext(mocker.Mock(), {}, None, None)
+    df = list(python_model.render(context=context))[0]
+    assert df.to_dict(orient="records") == [{"a": "test_value"}]
+
+
+def test_macros_python_sql_model(mocker: MockerFixture) -> None:
+    @macro()
+    def end_date_macro(evaluator: MacroEvaluator, var: bool):
+        return f"@IF({var} = False, '1 day ago', '2025-01-01 12:00:00')"
+
+    @model(
+        "test_macros_python_model_@{bar}",
+        is_sql=True,
+        kind="full",
+        cron="@daily",
+        columns={"a": "string"},
+        enabled="@IF(@gateway = 'dev', True, False)",
+        start="@IF(@gateway = 'dev', '1 month ago', '2024-01-01')",
+        end="@end_date_macro(@{global_var})",
+        owner="@IF(@gateway = 'dev', @{dev_owner}, @{prod_owner})",
+        stamp="@{stamp}",
+        tags=["@{tag1}", "@{tag2}"],
+        description="Model desc @{test_}",
+    )
+    def model_with_macros(evaluator, **kwargs):
+        return exp.select(
+            exp.convert(evaluator.var("TEST_VAR_A")).as_("a"),
+        )
+
+    python_sql_model = model.get_registry()["test_macros_python_model_@{bar}"].model(
+        module_path=Path("."),
+        path=Path("."),
+        macros=macro.get_registry(),
+        variables={
+            "test_var_a": "test_value",
+            "test_var_unused": 2,
+            "bar": "suffix",
+            "gateway": "dev",
+            "global_var": False,
+            "dev_owner": "dv_1",
+            "prod_owner": "pr_1",
+            "stamp": "bump",
+            "time_col": "a",
+            "tag1": "tag__1",
+            "tag2": "tag__2",
+        },
+    )
+
+    assert python_sql_model.name == "test_macros_python_model_suffix"
+    assert python_sql_model.python_env[c.SQLMESH_VARS] == Executable.value(
+        {"test_var_a": "test_value"}
+    )
+
+    assert python_sql_model.enabled
+    assert python_sql_model.start == "1 month ago"
+    assert python_sql_model.end == "1 day ago"
+    assert python_sql_model.owner == "dv_1"
+    assert python_sql_model.stamp == "bump"
+    assert python_sql_model.description == "Model desc @{test_}"
+    assert python_sql_model.tags == ["tag__1", "tag__2"]
+
+    context = ExecutionContext(mocker.Mock(), {}, None, None)
+    query = list(python_sql_model.render(context=context))[0]
+    assert query.sql() == """SELECT 'test_value' AS "a" """.strip()
+
+
+def test_unrendered_macros_python_model(mocker: MockerFixture) -> None:
+    @model(
+        "test_unrendered_macros_python_model_@{bar}",
+        is_sql=True,
+        kind=dict(
+            name=ModelKindName.INCREMENTAL_BY_UNIQUE_KEY,
+            unique_key="@{key}",
+            merge_filter="source.id > 0 and target.updated_at < @end_ds and source.updated_at > @start_ds",
+        ),
+        cron="@daily",
+        columns={"a": "string"},
+        allow_partials="@IF(@gateway = 'dev', True, False)",
+        physical_properties=dict(
+            location1="@'s3://bucket/prefix/@{schema_name}/@{table_name}'",
+            location2="@IF(@gateway = 'dev', @'hdfs://@{catalog_name}/@{schema_name}/dev/@{table_name}', @'s3://prod/@{table_name}')",
+        ),
+        virtual_properties={"creatable_type": "@{create_type}"},
+        session_properties={
+            "spark.executor.cores": "@IF(@gateway = 'dev', 1, 2)",
+            "spark.executor.memory": "1G",
+        },
+    )
+    def model_with_macros(evaluator, **kwargs):
+        return exp.select(
+            exp.convert(evaluator.var("TEST_VAR_A")).as_("a"),
+        )
+
+    python_sql_model = model.get_registry()["test_unrendered_macros_python_model_@{bar}"].model(
+        module_path=Path("."),
+        path=Path("."),
+        macros=macro.get_registry(),
+        variables={
+            "test_var_a": "test_value",
+            "bar": "suffix",
+            "gateway": "dev",
+            "key": "a",
+            "create_type": "'SECURE'",
+        },
+    )
+
+    assert python_sql_model.name == "test_unrendered_macros_python_model_suffix"
+    assert python_sql_model.python_env[c.SQLMESH_VARS] == Executable.value(
+        {"test_var_a": "test_value"}
+    )
+    assert python_sql_model.enabled
+
+    context = ExecutionContext(mocker.Mock(), {}, None, None)
+    query = list(python_sql_model.render(context=context))[0]
+    assert query.sql() == """SELECT 'test_value' AS "a" """.strip()
+    assert python_sql_model.allow_partials
+
+    assert "location1" in python_sql_model.physical_properties
+    assert "location2" in python_sql_model.physical_properties
+
+    assert python_sql_model.session_properties == {
+        "spark.executor.cores": 1,
+        "spark.executor.memory": "1G",
+    }
+    assert python_sql_model.virtual_properties["creatable_type"].this == "SECURE"
+
+    # The physical_properties will stay unrendered at load time
+    assert (
+        python_sql_model.physical_properties["location1"].text("this")
+        == "@'s3://bucket/prefix/@{schema_name}/@{table_name}'"
+    )
+    assert (
+        python_sql_model.physical_properties["location2"].text("this")
+        == "@IF(@gateway = 'dev', @'hdfs://@{catalog_name}/@{schema_name}/dev/@{table_name}', @'s3://prod/@{table_name}')"
+    )
+
+    # Merge_filter will stay unrendered as well
+    assert python_sql_model.unique_key[0] == exp.column("a", quoted=True)
+    assert (
+        python_sql_model.merge_filter.sql()
+        == "source.id > 0 AND target.updated_at < @end_ds AND source.updated_at > @start_ds"
     )
 
 
@@ -5245,6 +5520,62 @@ def test_this_model() -> None:
         )
         == 'SELECT 1 AS "COL", TRUE AS "THIS_MODEL_RESOLVES_TO_QUOTED_TABLE"'
     )
+
+
+def test_macros_in_physical_properties(make_snapshot):
+    expressions = d.parse(
+        """
+        MODEL (
+            name test.test_model,
+            kind FULL,
+            physical_properties (
+                location1 = @resolve_template('s3://bucket/prefix/@{schema_name}/@{table_name}'),
+                location2 = @IF(
+                    @gateway = 'dev',
+                    @resolve_template('hdfs://@{catalog_name}/@{schema_name}/dev/@{table_name}'),
+                    @resolve_template('s3://prod/@{table_name}')
+                ),
+                sort_order = @IF(@gateway = 'prod', 'desc', 'asc')
+            )
+        );
+
+        SELECT 1;
+        """
+    )
+
+    model = load_sql_based_model(
+        expressions, variables={"gateway": "dev"}, default_catalog="unit_test"
+    )
+
+    assert model.name == "test.test_model"
+    assert "location1" in model.physical_properties
+    assert "location2" in model.physical_properties
+    assert "sort_order" in model.physical_properties
+
+    # load time is a no-op
+    assert isinstance(model.physical_properties["location1"], d.MacroFunc)
+    assert isinstance(model.physical_properties["location2"], d.MacroFunc)
+    assert isinstance(model.physical_properties["sort_order"], d.MacroFunc)
+
+    # substitution occurs at runtime
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    rendered_physical_properties = model.render_physical_properties(
+        snapshots={model.fqn: snapshot},  # to trigger @this_model generation
+        runtime_stage=RuntimeStage.CREATING,
+        python_env=model.python_env,
+    )
+
+    assert (
+        rendered_physical_properties["location1"].text("this")
+        == f"s3://bucket/prefix/sqlmesh__test/test__test_model__{snapshot.version}"
+    )
+    assert (
+        rendered_physical_properties["location2"].text("this")
+        == f"hdfs://unit_test/sqlmesh__test/dev/test__test_model__{snapshot.version}"
+    )
+    assert rendered_physical_properties["sort_order"].text("this") == "asc"
 
 
 def test_macros_in_model_statement(sushi_context, assert_exp_eq):
@@ -5692,6 +6023,32 @@ def my_model(context, **kwargs):
     context = Context(paths=tmp_path, config=config)
     assert context.get_model(expected_name).name == expected_name
     assert isinstance(context.get_model(expected_name), PythonModel)
+
+
+def test_python_model_name_inference_multiple_models(tmp_path: Path) -> None:
+    init_example_project(tmp_path, dialect="duckdb")
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+        model_naming=NameInferenceConfig(infer_names=True),
+    )
+
+    path_a = tmp_path / "models/test_schema/test_model_a.py"
+    path_b = tmp_path / "models/test_schema/test_model_b.py"
+
+    model_payload = """from sqlmesh import model
+@model(
+    columns={'"COL"': "int"},
+)
+def my_model(context, **kwargs):
+    pass"""
+
+    path_a.parent.mkdir(parents=True, exist_ok=True)
+    path_a.write_text(model_payload)
+    path_b.write_text(model_payload)
+
+    context = Context(paths=tmp_path, config=config)
+    assert context.get_model("test_schema.test_model_a").name == "test_schema.test_model_a"
+    assert context.get_model("test_schema.test_model_b").name == "test_schema.test_model_b"
 
 
 def test_custom_kind():
@@ -7220,3 +7577,181 @@ def test_partition_interval_unit():
     )
     model = load_sql_based_model(expressions)
     assert model.partition_interval_unit is None
+
+
+def test_model_blueprinting(tmp_path: Path) -> None:
+    init_example_project(tmp_path, dialect="duckdb", template=ProjectTemplate.EMPTY)
+
+    db_path = str(tmp_path / "db.db")
+    db_connection = DuckDBConnectionConfig(database=db_path)
+
+    gateways = {
+        "gw1": GatewayConfig(connection=db_connection, variables={"x": 1}),
+        "gw2": GatewayConfig(connection=db_connection, variables={"x": 2}),
+    }
+    config = Config(
+        gateways=gateways,
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+    )
+
+    blueprint_sql = tmp_path / "macros" / "identity_macro.py"
+    blueprint_sql.parent.mkdir(parents=True, exist_ok=True)
+    blueprint_sql.write_text(
+        """from sqlmesh import macro
+
+@macro()
+def identity(evaluator, value):
+    return value
+"""
+    )
+    blueprint_sql = tmp_path / "models" / "blueprint.sql"
+    blueprint_sql.parent.mkdir(parents=True, exist_ok=True)
+    blueprint_sql.write_text(
+        """
+        MODEL (
+          name @{blueprint}.test_model_sql,
+          gateway @identity(@blueprint),
+          blueprints ((blueprint := gw1), (blueprint := gw2)),
+          kind FULL
+        );
+
+        SELECT
+          @x AS x
+        """
+    )
+    blueprint_pydf = tmp_path / "models" / "blueprint_df.py"
+    blueprint_pydf.parent.mkdir(parents=True, exist_ok=True)
+    blueprint_pydf.write_text(
+        """
+import pandas as pd
+from sqlmesh import model
+
+
+@model(
+    "@{blueprint}.test_model_pydf",
+    gateway="@blueprint",
+    blueprints=[{"blueprint": "gw1"}, {"blueprint": "gw2"}],
+    kind="FULL",
+    columns={"x": "INT"},
+)
+def entrypoint(context, *args, **kwargs):
+    x_var = context.var("x")
+    return pd.DataFrame({"x": [x_var]})"""
+    )
+    blueprint_pysql = tmp_path / "models" / "blueprint_sql.py"
+    blueprint_pysql.parent.mkdir(parents=True, exist_ok=True)
+    blueprint_pysql.write_text(
+        """
+from sqlmesh import model
+
+
+@model(
+    "@{blueprint}.test_model_pysql",
+    gateway="@blueprint",
+    blueprints=[{"blueprint": "gw1"}, {"blueprint": "gw2"}],
+    kind="FULL",
+    is_sql=True,
+)
+def entrypoint(evaluator):
+    x_var = evaluator.var("x")
+    return f'SELECT {x_var} AS x'"""
+    )
+
+    context = Context(paths=tmp_path, config=config)
+    models = context.models
+
+    # Each of the three model files "expands" into two models
+    assert len(models) == 6
+
+    context.plan(no_prompts=True, auto_apply=True, no_diff=True)
+
+    for model_name in ("test_model_sql", "test_model_pydf", "test_model_pysql"):
+        for gateway_no in range(1, 3):
+            model = models.get(f'"db"."gw{gateway_no}"."{model_name}"')
+
+            assert model is not None
+            assert "blueprints" not in model.all_fields()
+            assert model.python_env.get(c.SQLMESH_VARS) == Executable.value({"x": gateway_no})
+            assert context.fetchdf(f"from {model.fqn}").to_dict() == {"x": {0: gateway_no}}
+
+    multi_variable_blueprint_example = tmp_path / "models" / "multi_variable_blueprint_example.sql"
+    multi_variable_blueprint_example.parent.mkdir(parents=True, exist_ok=True)
+    multi_variable_blueprint_example.write_text(
+        """
+        MODEL (
+          name @{customer}.my_table,
+          blueprints (
+            (customer := customer1, foo := 'bar'),
+            (customer := customer2, foo := qux),
+          ),
+          kind FULL
+        );
+
+        SELECT
+          @VAR('foo') AS foo,
+        FROM @VAR('customer').my_source
+        """
+    )
+
+    context = Context(paths=tmp_path, config=config)
+    models = context.models
+
+    # The new model expands into another 2 new models
+    assert len(models) == 8
+
+    customer1_model = models.get('"db"."customer1"."my_table"')
+
+    assert customer1_model is not None
+    assert customer1_model.python_env.get(c.SQLMESH_VARS) == Executable.value(
+        {"customer": "customer1", "foo": "'bar'"}
+    )
+    assert t.cast(exp.Expression, customer1_model.render_query()).sql() == (
+        """SELECT '''bar''' AS "foo" FROM "db"."customer1"."my_source" AS "my_source\""""
+    )
+
+    customer2_model = models.get('"db"."customer2"."my_table"')
+
+    assert customer2_model is not None
+    assert customer2_model.python_env.get(c.SQLMESH_VARS) == Executable.value(
+        {"customer": "customer2", "foo": "qux"}
+    )
+    assert t.cast(exp.Expression, customer2_model.render_query()).sql() == (
+        '''SELECT 'qux' AS "foo" FROM "db"."customer2"."my_source" AS "my_source"'''
+    )
+
+
+@time_machine.travel("2020-01-01 00:00:00 UTC")
+def test_dynamic_date_spine_model(assert_exp_eq):
+    @macro()
+    def get_current_date(evaluator):
+        from sqlmesh.utils.date import now
+
+        return f"'{now().date()}'"
+
+    expressions = d.parse(
+        """
+        MODEL (name test_model, dialect duckdb);
+
+        @DEF(curr_date, @get_current_date());
+
+        WITH discount_promotion_dates AS (
+          @date_spine('day', @curr_date::date - 90, @curr_date::date)
+        )
+
+        SELECT * FROM discount_promotion_dates
+        """
+    )
+    model = load_sql_based_model(expressions)
+    assert_exp_eq(
+        model.render_query(),
+        """
+        WITH "discount_promotion_dates" AS (
+          SELECT
+            "_exploded"."date_day" AS "date_day"
+          FROM UNNEST(CAST(GENERATE_SERIES(CAST('2020-01-01' AS DATE) - 90, CAST('2020-01-01' AS DATE), INTERVAL '1' DAY) AS DATE[])) AS "_exploded"("date_day")
+        )
+        SELECT
+          "discount_promotion_dates"."date_day" AS "date_day"
+        FROM "discount_promotion_dates" AS "discount_promotion_dates"
+        """,
+    )
