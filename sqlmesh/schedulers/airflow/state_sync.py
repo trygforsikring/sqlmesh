@@ -4,7 +4,7 @@ import logging
 import typing as t
 
 from sqlmesh.core.console import Console
-from sqlmesh.core.environment import Environment
+from sqlmesh.core.environment import Environment, EnvironmentStatements
 from sqlmesh.core.snapshot import (
     Snapshot,
     SnapshotId,
@@ -67,6 +67,12 @@ class HttpStateSync(StateSync):
             A list of all environments.
         """
         return self._client.get_environments()
+
+    def get_environments_summary(self) -> t.Dict[str, int]:
+        """Fetches all environment names along with expiry datetime."""
+        raise NotImplementedError(
+            "get_environments_summary method is not implemented for the Airflow state sync."
+        )
 
     def max_interval_end_per_model(
         self,
@@ -243,6 +249,7 @@ class HttpStateSync(StateSync):
         self,
         environment: Environment,
         no_gaps_snapshot_names: t.Optional[t.Set[str]] = None,
+        environment_statements: t.Optional[t.List[EnvironmentStatements]] = None,
     ) -> PromotionResult:
         """Update the environment to reflect the current state.
 
@@ -316,6 +323,20 @@ class HttpStateSync(StateSync):
         raise NotImplementedError(
             "Updating auto restatements is not supported by the Airflow state sync."
         )
+
+    def get_environment_statements(self, environment: str) -> t.List[EnvironmentStatements]:
+        """Fetches the environment's statements from the environment_statements table.
+        Args:
+            environment: The environment name
+
+        Returns:
+            A list of the environment statements.
+
+        """
+        logger.warning(
+            "Fetching environment statements is not supported by the Airflow state sync."
+        )
+        return []
 
     def migrate(
         self,

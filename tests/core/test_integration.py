@@ -32,6 +32,7 @@ from sqlmesh.core.engine_adapter import EngineAdapter
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.macros import macro
 from sqlmesh.core.model import (
+    FullKind,
     IncrementalByTimeRangeKind,
     IncrementalByUniqueKeyKind,
     Model,
@@ -56,6 +57,7 @@ from sqlmesh.core.snapshot import (
 )
 from sqlmesh.utils.date import TimeLike, now, to_date, to_datetime, to_timestamp
 from sqlmesh.utils.errors import NoChangesPlanError
+from sqlmesh.utils.pydantic import validate_string
 from tests.conftest import DuckDBMetadata, SushiDataValidator
 
 
@@ -1216,8 +1218,12 @@ def test_non_breaking_change_after_forward_only_in_dev(
 
 @time_machine.travel("2023-01-08 15:00:00 UTC")
 def test_indirect_non_breaking_change_after_forward_only_in_dev(init_and_plan_context: t.Callable):
-    context, plan = init_and_plan_context("examples/sushi")
-    context.apply(plan)
+    context, _ = init_and_plan_context("examples/sushi")
+    # Make sure that the most downstream model is a materialized model.
+    model = context.get_model("sushi.top_waiters")
+    model = model.copy(update={"kind": FullKind()})
+    context.upsert_model(model)
+    context.plan("prod", skip_tests=True, auto_apply=True, no_prompts=True)
 
     # Make sushi.orders a forward-only model.
     model = context.get_model("sushi.orders")
@@ -1870,18 +1876,16 @@ def test_custom_materialization(init_and_plan_context: t.Callable):
 # needs to be defined at the top level. If its defined within the test body,
 # adding to the snapshot cache fails with: AttributeError: Can't pickle local object
 class TestCustomKind(CustomKind):
-    custom_property: t.Optional[str] = None
-
     @property
-    def data_hash_values(self) -> t.List[t.Optional[str]]:
-        return [*super().data_hash_values, self.custom_property]
+    def custom_property(self) -> str:
+        return validate_string(self.materialization_properties.get("custom_property"))
 
 
 @time_machine.travel("2023-01-08 15:00:00 UTC")
 def test_custom_materialization_with_custom_kind(init_and_plan_context: t.Callable):
     context, _ = init_and_plan_context("examples/sushi")
 
-    custom_insert_call_count = 0
+    custom_insert_calls = []
 
     class CustomFullMaterialization(CustomMaterialization[TestCustomKind]):
         NAME = "test_custom_full_with_custom_kind"
@@ -1894,10 +1898,10 @@ def test_custom_materialization_with_custom_kind(init_and_plan_context: t.Callab
             is_first_insert: bool,
             **kwargs: t.Any,
         ) -> None:
-            nonlocal custom_insert_call_count
-            custom_insert_call_count += 1
-
             assert isinstance(model.kind, TestCustomKind)
+
+            nonlocal custom_insert_calls
+            custom_insert_calls.append(model.kind.custom_property)
 
             self._replace_query_for_model(model, table_name, query_or_df)
 
@@ -1905,25 +1909,29 @@ def test_custom_materialization_with_custom_kind(init_and_plan_context: t.Callab
     kwargs = {
         **model.dict(),
         # Make a breaking change.
-        "kind": dict(name="CUSTOM", materialization="test_custom_full_with_custom_kind"),
+        "kind": dict(
+            name="CUSTOM",
+            materialization="test_custom_full_with_custom_kind",
+            materialization_properties={"custom_property": "pytest"},
+        ),
     }
     context.upsert_model(SqlModel.parse_obj(kwargs))
 
     context.plan(auto_apply=True)
 
-    assert custom_insert_call_count == 1
+    assert custom_insert_calls == ["pytest"]
 
     # no changes
     context.plan(auto_apply=True)
 
-    assert custom_insert_call_count == 1
+    assert custom_insert_calls == ["pytest"]
 
     # change a property on the custom kind, breaking change
-    kwargs["kind"]["custom_property"] = "some value"
+    kwargs["kind"]["materialization_properties"]["custom_property"] = "some value"
     context.upsert_model(SqlModel.parse_obj(kwargs))
     context.plan(auto_apply=True)
 
-    assert custom_insert_call_count == 2
+    assert custom_insert_calls == ["pytest", "some value"]
 
 
 @time_machine.travel("2023-01-08 15:00:00 UTC")
@@ -2153,7 +2161,7 @@ def test_restatement_plan_ignores_changes(init_and_plan_context: t.Callable):
     assert not plan.new_snapshots
     assert plan.requires_backfill
     assert plan.restatements == {
-        restated_snapshot.snapshot_id: (to_timestamp("2023-01-01"), to_timestamp("2023-01-08"))
+        restated_snapshot.snapshot_id: (to_timestamp("2023-01-01"), to_timestamp("2023-01-09"))
     }
     assert plan.missing_intervals == [
         SnapshotIntervals(
@@ -4135,6 +4143,14 @@ def test_multi(mocker):
     assert len(plan.new_snapshots) == 5
     context.apply(plan)
 
+    # Ensure before_all, after_all statements for multiple repos have executed
+    environment_statements = context.state_reader.get_environment_statements(c.PROD)
+    assert len(environment_statements) == 2
+    assert context.fetchdf("select * from before_1").to_dict()["1"][0] == 1
+    assert context.fetchdf("select * from before_2").to_dict()["2"][0] == 2
+    assert context.fetchdf("select * from after_1").to_dict()["repo_1"][0] == "repo_1"
+    assert context.fetchdf("select * from after_2").to_dict()["repo_2"][0] == "repo_2"
+
     adapter = context.engine_adapter
     context = Context(
         paths=["examples/multi/repo_1"],
@@ -4160,6 +4176,16 @@ def test_multi(mocker):
     assert len(plan.missing_intervals) == 3
     context.apply(plan)
     validate_apply_basics(context, c.PROD, plan.snapshots.values())
+
+    # Ensure only repo_1's environment statements have executed in this context
+    environment_statements = context.state_reader.get_environment_statements(c.PROD)
+    assert len(environment_statements) == 1
+    assert environment_statements[0].before_all == [
+        "CREATE TABLE IF NOT EXISTS before_1 AS select @one()"
+    ]
+    assert environment_statements[0].after_all == [
+        "CREATE TABLE IF NOT EXISTS after_1 AS select @dup()"
+    ]
 
 
 def test_multi_dbt(mocker):
@@ -4562,16 +4588,41 @@ def test_restatement_of_full_model_with_start(init_and_plan_context: t.Callable)
         no_prompts=True,
     )
 
-    restatement_end = to_timestamp("2023-01-08")
-
     sushi_customer_interval = restatement_plan.restatements[
         context.get_snapshot("sushi.customers").snapshot_id
     ]
-    assert sushi_customer_interval == (to_timestamp("2023-01-01"), restatement_end)
+    assert sushi_customer_interval == (to_timestamp("2023-01-01"), to_timestamp("2023-01-09"))
     waiter_by_day_interval = restatement_plan.restatements[
         context.get_snapshot("sushi.waiter_as_customer_by_day").snapshot_id
     ]
-    assert waiter_by_day_interval == (to_timestamp("2023-01-07"), restatement_end)
+    assert waiter_by_day_interval == (to_timestamp("2023-01-07"), to_timestamp("2023-01-08"))
+
+
+@time_machine.travel("2023-01-08 15:00:00 UTC")
+def test_restatement_shouldnt_backfill_beyond_prod_intervals(init_and_plan_context: t.Callable):
+    context, _ = init_and_plan_context("examples/sushi")
+
+    model = context.get_model("sushi.top_waiters")
+    context.upsert_model(SqlModel.parse_obj({**model.dict(), "cron": "@hourly"}))
+
+    context.plan("prod", auto_apply=True, no_prompts=True, skip_tests=True)
+    context.run()
+
+    with time_machine.travel("2023-01-09 02:00:00 UTC"):
+        # It's time to backfill the waiter_revenue_by_day model but it hasn't run yet
+        restatement_plan = context.plan(
+            restate_models=["sushi.waiter_revenue_by_day"],
+            no_prompts=True,
+            skip_tests=True,
+        )
+        intervals_by_id = {i.snapshot_id: i for i in restatement_plan.missing_intervals}
+        # Make sure the intervals don't go beyond the prod intervals
+        assert intervals_by_id[context.get_snapshot("sushi.top_waiters").snapshot_id].intervals[-1][
+            1
+        ] == to_timestamp("2023-01-08 15:00:00 UTC")
+        assert intervals_by_id[
+            context.get_snapshot("sushi.waiter_revenue_by_day").snapshot_id
+        ].intervals[-1][1] == to_timestamp("2023-01-08 00:00:00 UTC")
 
 
 def initial_add(context: Context, environment: str):
@@ -4582,6 +4633,54 @@ def initial_add(context: Context, environment: str):
 
     context.apply(plan)
     validate_apply_basics(context, environment, plan.snapshots.values())
+
+
+def test_plan_production_environment_statements(tmp_path: Path):
+    model_a = """
+    MODEL (
+        name test_schema.a,
+        kind FULL,
+    );
+
+    @IF(
+        @runtime_stage = 'creating',
+        INSERT INTO schema_names_for_prod (physical_schema_name) VALUES (@resolve_template('@{schema_name}'))
+    );
+
+    SELECT 1 AS account_id
+    """
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+
+    for path, defn in {"a.sql": model_a}.items():
+        with open(models_dir / path, "w") as f:
+            f.write(defn)
+
+    before_all = [
+        "CREATE TABLE IF NOT EXISTS schema_names_for_@this_env (physical_schema_name VARCHAR)"
+    ]
+    after_all = ["@IF(@this_env = 'prod', CREATE TABLE IF NOT EXISTS after_t AS SELECT @var_5)"]
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+        before_all=before_all,
+        after_all=after_all,
+        variables={"var_5": 5},
+    )
+    ctx = Context(paths=[tmp_path], config=config)
+    ctx.plan(auto_apply=True, no_prompts=True)
+
+    before_t = ctx.fetchdf("select * from schema_names_for_prod").to_dict()
+    assert before_t["physical_schema_name"][0] == "sqlmesh__test_schema"
+
+    after_t = ctx.fetchdf("select * from after_t").to_dict()
+    assert after_t["5"][0] == 5
+
+    environment_statements = ctx.state_reader.get_environment_statements(c.PROD)
+    assert environment_statements[0].before_all == before_all
+    assert environment_statements[0].after_all == after_all
+    assert environment_statements[0].python_env.keys() == {"__sqlmesh__vars__"}
+    assert environment_statements[0].python_env["__sqlmesh__vars__"].payload == "{'var_5': 5}"
 
 
 def apply_to_environment(

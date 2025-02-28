@@ -9,7 +9,7 @@ import typing as t
 from sqlglot import __version__ as SQLGLOT_VERSION
 
 from sqlmesh import migrations
-from sqlmesh.core.environment import Environment, EnvironmentNamingInfo
+from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
 from sqlmesh.core.snapshot import (
     Snapshot,
     SnapshotId,
@@ -136,6 +136,14 @@ class StateReader(abc.ABC):
         """
 
     @abc.abstractmethod
+    def get_environments_summary(self) -> t.Dict[str, int]:
+        """Fetches all environment names along with expiry datetime.
+
+        Returns:
+            A dict of all environment names along with expiry datetime.
+        """
+
+    @abc.abstractmethod
     def max_interval_end_per_model(
         self,
         environment: str,
@@ -175,6 +183,14 @@ class StateReader(abc.ABC):
 
         Args:
             next_auto_restatement_ts: A dictionary of snapshot name / version pairs to the next auto restatement timestamp.
+        """
+
+    @abc.abstractmethod
+    def get_environment_statements(self, environment: str) -> t.List[EnvironmentStatements]:
+        """Fetches environment statements from the environment_statements table.
+
+        Returns:
+            A list of the Environment Statements.
         """
 
     def get_versions(self, validate: bool = True) -> Versions:
@@ -244,11 +260,8 @@ class StateReader(abc.ABC):
         return versions
 
     @abc.abstractmethod
-    def _get_versions(self, lock_for_update: bool = False) -> Versions:
+    def _get_versions(self) -> Versions:
         """Queries the store to get the current versions of SQLMesh and deps.
-
-        Args:
-            lock_for_update: Whether or not the usage of this method plans to update the row.
 
         Returns:
             The versions object.
@@ -337,6 +350,7 @@ class StateSync(StateReader, abc.ABC):
         self,
         environment: Environment,
         no_gaps_snapshot_names: t.Optional[t.Set[str]] = None,
+        environment_statements: t.Optional[t.List[EnvironmentStatements]] = None,
     ) -> PromotionResult:
         """Update the environment to reflect the current state.
 
@@ -431,7 +445,7 @@ class StateSync(StateReader, abc.ABC):
             end: The end of the interval to add.
             is_dev: Indicates whether the given interval is being added while in development mode
         """
-        start_ts, end_ts = snapshot.inclusive_exclusive(start, end, strict=False)
+        start_ts, end_ts = snapshot.inclusive_exclusive(start, end, strict=False, expand=False)
         if not snapshot.version:
             raise SQLMeshError("Snapshot version must be set to add an interval.")
         intervals = [(start_ts, end_ts)]
@@ -439,6 +453,7 @@ class StateSync(StateReader, abc.ABC):
             name=snapshot.name,
             identifier=snapshot.identifier,
             version=snapshot.version,
+            dev_version=snapshot.dev_version,
             intervals=intervals if not is_dev else [],
             dev_intervals=intervals if is_dev else [],
         )

@@ -300,6 +300,10 @@ class Console(abc.ABC):
     ) -> None:
         """Show table summary diff."""
 
+    @abc.abstractmethod
+    def print_environments(self, environments_summary: t.Dict[str, int]) -> None:
+        """Prints all environment names along with expiry datetime."""
+
     def _limit_model_names(self, tree: Tree, verbose: bool = False) -> Tree:
         """Trim long indirectly modified model lists below threshold."""
         modified_length = len(tree.children)
@@ -465,6 +469,9 @@ class NoopConsole(Console):
     def show_row_diff(
         self, row_diff: RowDiff, show_sample: bool = True, skip_grain_check: bool = False
     ) -> None:
+        pass
+
+    def print_environments(self, environments_summary: t.Dict[str, int]) -> None:
         pass
 
 
@@ -845,6 +852,11 @@ class TerminalConsole(Console):
 
         if context_diff.has_requirement_changes:
             self._print(f"[bold]Requirements:\n{context_diff.requirements_diff()}")
+
+        if context_diff.has_environment_statements_changes:
+            self._print(
+                f"[bold]Environment statements:\n{context_diff.environment_statements_diff()}"
+            )
 
         self._show_summary_tree_for(
             context_diff,
@@ -1429,6 +1441,15 @@ class TerminalConsole(Console):
                 self.console.print(f"\n[b][green]{target_name} ONLY[/green] sample rows:[/b]")
                 self.console.print(row_diff.t_sample.to_string(index=False), end="\n\n")
 
+    def print_environments(self, environments_summary: t.Dict[str, int]) -> None:
+        """Prints all environment names along with expiry datetime."""
+        output = [
+            f"{name} - {time_like_to_str(ts)}" if ts else f"{name} - No Expiry"
+            for name, ts in environments_summary.items()
+        ]
+        output_str = "\n".join([str(len(output)), *output])
+        self.log_status_update(f"Number of SQLMesh environments are: {output_str}")
+
     def _get_snapshot_change_category(
         self,
         snapshot: Snapshot,
@@ -1892,6 +1913,9 @@ class MarkdownConsole(CaptureTerminalConsole):
 
         if context_diff.has_requirement_changes:
             self._print(f"Requirements:\n{context_diff.requirements_diff()}")
+
+        if context_diff.has_environment_statements_changes:
+            self._print(f"Environment statements:\n{context_diff.environment_statements_diff()}")
 
         added_snapshots = {context_diff.snapshots[s_id] for s_id in context_diff.added}
         added_snapshot_models = {s for s in added_snapshots if s.is_model}
@@ -2364,6 +2388,9 @@ class DebuggerTerminalConsole(TerminalConsole):
 
         if context_diff.has_requirement_changes:
             self._write(f"Requirements:\n{context_diff.requirements_diff()}")
+
+        if context_diff.has_environment_statements_changes:
+            self._write(f"Environment statements:\n{context_diff.environment_statements_diff()}")
 
         for added in context_diff.new_snapshots:
             self._write(f"  Added: {added}")

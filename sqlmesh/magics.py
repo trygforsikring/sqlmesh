@@ -493,7 +493,7 @@ class SQLMeshMagics(Magics):
         """Evaluate the DAG of models using the built-in scheduler."""
         args = parse_argstring(self.run_dag, line)
 
-        success = context.run(
+        completion_status = context.run(
             args.environment,
             start=args.start,
             end=args.end,
@@ -503,7 +503,7 @@ class SQLMeshMagics(Magics):
             exit_on_env_update=args.exit_on_env_update,
             no_auto_upstream=args.no_auto_upstream,
         )
-        if not success:
+        if completion_status.is_failure:
             raise SQLMeshError("Error Running DAG. Check logs for details.")
 
     @magic_arguments()
@@ -1008,6 +1008,13 @@ class SQLMeshMagics(Magics):
         """Clears the SQLMesh cache and any build artifacts."""
         context.clear_caches()
         context.console.log_success("SQLMesh cache and build artifacts cleared")
+
+    @magic_arguments()
+    @line_magic
+    @pass_sqlmesh_context
+    def environments(self, context: Context, line: str) -> None:
+        """Prints the list of SQLMesh environments with its expiry datetime."""
+        context.print_environment_names()
 
 
 def register_magics() -> None:

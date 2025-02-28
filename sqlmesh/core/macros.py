@@ -48,6 +48,7 @@ if t.TYPE_CHECKING:
     from sqlmesh.core._typing import TableName
     from sqlmesh.core.engine_adapter import EngineAdapter
     from sqlmesh.core.snapshot import Snapshot
+    from sqlmesh.core.environment import EnvironmentNamingInfo
 
 
 if sys.version_info >= (3, 10):
@@ -63,6 +64,8 @@ class RuntimeStage(Enum):
     PROMOTING = "promoting"
     AUDITING = "auditing"
     TESTING = "testing"
+    BEFORE_ALL = "before_all"
+    AFTER_ALL = "after_all"
 
 
 class MacroStrTemplate(Template):
@@ -155,6 +158,7 @@ class MacroEvaluator:
         snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
         default_catalog: t.Optional[str] = None,
         path: Path = Path(),
+        environment_naming_info: t.Optional[EnvironmentNamingInfo] = None,
     ):
         self.dialect = dialect
         self.generator = MacroDialect().generator()
@@ -178,6 +182,7 @@ class MacroEvaluator:
         self._snapshots = snapshots if snapshots is not None else {}
         self.default_catalog = default_catalog
         self._path = path
+        self._environment_naming_info = environment_naming_info
 
         prepare_env(self.python_env, self.env)
         for k, v in self.python_env.items():
@@ -1291,7 +1296,7 @@ def call_macro(
 
 
 def _coerce(
-    expr: exp.Expression,
+    expr: t.Any,
     typ: t.Any,
     dialect: DialectType,
     path: Path,
@@ -1300,7 +1305,7 @@ def _coerce(
     """Coerces the given expression to the specified type on a best-effort basis."""
     base_err_msg = f"Failed to coerce expression '{expr}' to type '{typ}'."
     try:
-        if typ is None or typ is t.Any:
+        if typ is None or typ is t.Any or not isinstance(expr, exp.Expression):
             return expr
         base = t.get_origin(typ) or typ
 

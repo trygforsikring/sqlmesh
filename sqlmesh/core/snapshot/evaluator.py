@@ -51,6 +51,7 @@ from sqlmesh.core.model import (
     ViewKind,
     CustomKind,
 )
+
 from sqlmesh.core.schema_diff import has_drop_alteration, get_dropped_column_names
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
@@ -352,12 +353,12 @@ class SnapshotEvaluator:
             on_start(len(snapshots_to_create))
         self._create_schemas(tables_by_schema, gateway_by_schema)
         self._create_snapshots(
-            snapshots_to_create,
-            snapshots,
-            target_deployability_flags,
-            deployability_index,
-            on_complete,
-            allow_destructive_snapshots,
+            snapshots_to_create=snapshots_to_create,
+            snapshots=snapshots,
+            target_deployability_flags=target_deployability_flags,
+            deployability_index=deployability_index,
+            on_complete=on_complete,
+            allow_destructive_snapshots=allow_destructive_snapshots,
         )
 
     def _create_snapshots(
@@ -375,11 +376,11 @@ class SnapshotEvaluator:
                 snapshots_to_create,
                 lambda s: self._create_snapshot(
                     s,
-                    snapshots,
-                    target_deployability_flags[s.name],
-                    deployability_index,
-                    on_complete,
-                    allow_destructive_snapshots,
+                    snapshots=snapshots,
+                    deployability_flags=target_deployability_flags[s.name],
+                    deployability_index=deployability_index,
+                    on_complete=on_complete,
+                    allow_destructive_snapshots=allow_destructive_snapshots,
                 ),
                 self.ddl_concurrent_tasks,
             )
@@ -1131,7 +1132,7 @@ def _evaluation_strategy(snapshot: SnapshotInfoLike, adapter: EngineAdapter) -> 
             raise SQLMeshError(
                 f"Missing the name of a custom evaluation strategy in model '{snapshot.name}'."
             )
-        _, klass = get_custom_materialization_type(snapshot.custom_materialization)
+        _, klass = get_custom_materialization_type_or_raise(snapshot.custom_materialization)
         return klass(adapter)
     elif snapshot.is_managed:
         klass = EngineManagedStrategy
@@ -1953,36 +1954,46 @@ def get_custom_materialization_kind_type(st: t.Type[CustomMaterialization]) -> t
 
 
 def get_custom_materialization_type(
-    name: str,
-) -> t.Tuple[t.Type[CustomKind], t.Type[CustomMaterialization]]:
+    name: str, raise_errors: bool = True
+) -> t.Optional[t.Tuple[t.Type[CustomKind], t.Type[CustomMaterialization]]]:
     global _custom_materialization_type_cache
 
     strategy_key = name.lower()
-    if (
-        _custom_materialization_type_cache is None
-        or strategy_key not in _custom_materialization_type_cache
-    ):
-        strategy_types = list(CustomMaterialization.__subclasses__())
 
-        entry_points = metadata.entry_points(group="sqlmesh.materializations")
-        for entry_point in entry_points:
-            strategy_type = entry_point.load()
-            if not issubclass(strategy_type, CustomMaterialization):
-                raise SQLMeshError(
-                    f"Custom materialization entry point '{entry_point.name}' must be a subclass of CustomMaterialization."
+    try:
+        if (
+            _custom_materialization_type_cache is None
+            or strategy_key not in _custom_materialization_type_cache
+        ):
+            strategy_types = list(CustomMaterialization.__subclasses__())
+
+            entry_points = metadata.entry_points(group="sqlmesh.materializations")
+            for entry_point in entry_points:
+                strategy_type = entry_point.load()
+                if not issubclass(strategy_type, CustomMaterialization):
+                    raise SQLMeshError(
+                        f"Custom materialization entry point '{entry_point.name}' must be a subclass of CustomMaterialization."
+                    )
+                strategy_types.append(strategy_type)
+
+            _custom_materialization_type_cache = {
+                getattr(strategy_type, "NAME", strategy_type.__name__).lower(): (
+                    get_custom_materialization_kind_type(strategy_type),
+                    strategy_type,
                 )
-            strategy_types.append(strategy_type)
+                for strategy_type in strategy_types
+            }
 
-        _custom_materialization_type_cache = {
-            getattr(strategy_type, "NAME", strategy_type.__name__).lower(): (
-                get_custom_materialization_kind_type(strategy_type),
-                strategy_type,
-            )
-            for strategy_type in strategy_types
-        }
+        if strategy_key not in _custom_materialization_type_cache:
+            raise ConfigError(f"Materialization strategy with name '{name}' was not found.")
+    except (SQLMeshError, ConfigError) as e:
+        if raise_errors:
+            raise e
 
-    if strategy_key not in _custom_materialization_type_cache:
-        raise ConfigError(f"Materialization strategy with name '{name}' was not found.")
+        from sqlmesh.core.console import get_console
+
+        get_console().log_warning(str(e))
+        return None
 
     strategy_kind_type, strategy_type = _custom_materialization_type_cache[strategy_key]
     logger.debug(
@@ -1990,6 +2001,16 @@ def get_custom_materialization_type(
     )
 
     return strategy_kind_type, strategy_type
+
+
+def get_custom_materialization_type_or_raise(
+    name: str,
+) -> t.Tuple[t.Type[CustomKind], t.Type[CustomMaterialization]]:
+    if types := get_custom_materialization_type(name, raise_errors=True):
+        return types[0], types[1]
+
+    # Shouldnt get here as get_custom_materialization_type() has raise_errors=True, but just in case...
+    raise SQLMeshError(f"Custom materialization '{name}' not present in the Python environment")
 
 
 class EngineManagedStrategy(MaterializableStrategy):

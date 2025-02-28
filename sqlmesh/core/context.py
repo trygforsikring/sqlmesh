@@ -73,11 +73,12 @@ from sqlmesh.core.dialect import (
     parse_one,
 )
 from sqlmesh.core.engine_adapter import EngineAdapter
-from sqlmesh.core.environment import Environment, EnvironmentNamingInfo
+from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
 from sqlmesh.core.loader import Loader
 from sqlmesh.core.macros import ExecutableOrMacro, macro
 from sqlmesh.core.metric import Metric, rewrite
 from sqlmesh.core.model import Model, update_model_schemas
+from sqlmesh.core.config.model import ModelDefaultsConfig
 from sqlmesh.core.notification_target import (
     NotificationEvent,
     NotificationTarget,
@@ -345,6 +346,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._metrics: UniqueKeyDict[str, Metric] = UniqueKeyDict("metrics")
         self._jinja_macros = JinjaMacroRegistry()
         self._requirements: t.Dict[str, str] = {}
+        self._environment_statements: t.List[EnvironmentStatements] = []
         self._excluded_requirements: t.Set[str] = set()
         self._default_catalog: t.Optional[str] = None
         self._loaded: bool = False
@@ -352,13 +354,6 @@ class GenericContext(BaseContext, t.Generic[C]):
         self.path, self.config = t.cast(t.Tuple[Path, C], next(iter(self.configs.items())))
 
         self._all_dialects: t.Set[str] = {self.config.dialect or ""}
-
-        # This allows overriding the default dialect's normalization strategy, so for example
-        # one can do `dialect="duckdb,normalization_strategy=lowercase"` and this will be
-        # applied to the DuckDB dialect globally
-        if "normalization_strategy" in str(self.config.dialect):
-            dialect = Dialect.get_or_raise(self.config.dialect)
-            type(dialect).NORMALIZATION_STRATEGY = dialect.normalization_strategy
 
         if self.config.disable_anonymized_analytics:
             analytics.disable_analytics()
@@ -369,6 +364,23 @@ class GenericContext(BaseContext, t.Generic[C]):
         self.pinned_environments = Environment.sanitize_names(self.config.pinned_environments)
         self.auto_categorize_changes = self.config.plan.auto_categorize_changes
         self.selected_gateway = gateway or self.config.default_gateway_name
+
+        gw_model_defaults = self.config.gateways[self.selected_gateway].model_defaults
+        if gw_model_defaults:
+            # Merge global model defaults with the selected gateway's, if it's overriden
+            global_defaults = self.config.model_defaults.model_dump(exclude_unset=True)
+            gateway_defaults = gw_model_defaults.model_dump(exclude_unset=True)
+
+            self.config.model_defaults = ModelDefaultsConfig(
+                **{**global_defaults, **gateway_defaults}
+            )
+
+        # This allows overriding the default dialect's normalization strategy, so for example
+        # one can do `dialect="duckdb,normalization_strategy=lowercase"` and this will be
+        # applied to the DuckDB dialect globally
+        if "normalization_strategy" in str(self.config.dialect):
+            dialect = Dialect.get_or_raise(self.config.dialect)
+            type(dialect).NORMALIZATION_STRATEGY = dialect.normalization_strategy
 
         self._loaders = [
             (loader or config.loader)(self, path, **config.loader_kwargs)
@@ -564,6 +576,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._metrics.clear()
         self._requirements.clear()
         self._excluded_requirements.clear()
+        self._environment_statements = []
 
         for project in loaded_projects:
             self._jinja_macros = self._jinja_macros.merge(project.jinja_macros)
@@ -574,6 +587,8 @@ class GenericContext(BaseContext, t.Generic[C]):
             self._standalone_audits.update(project.standalone_audits)
             self._requirements.update(project.requirements)
             self._excluded_requirements.update(project.excluded_requirements)
+            if project.environment_statements:
+                self._environment_statements.append(project.environment_statements)
 
         uncached = set()
 
@@ -1180,6 +1195,10 @@ class GenericContext(BaseContext, t.Generic[C]):
             run=run,
             diff_rendered=diff_rendered,
         )
+
+        if no_auto_categorization:
+            # Prompts are required if the auto categorization is disabled
+            no_prompts = False
 
         self.console.plan(
             plan_builder,
@@ -1931,6 +1950,16 @@ class GenericContext(BaseContext, t.Generic[C]):
         if state_connection:
             self._try_connection("state backend", state_connection.connection_validator())
 
+    @python_api_analytics
+    def print_environment_names(self) -> None:
+        """Prints all environment names along with expiry datetime."""
+        result = self._new_state_sync().get_environments_summary()
+        if not result:
+            raise SQLMeshError(
+                "This project has no environments. Create an environment using the `sqlmesh plan` command."
+            )
+        self.console.print_environments(result)
+
     def close(self) -> None:
         """Releases all resources allocated by this context."""
         if self._snapshot_evaluator:
@@ -1967,6 +1996,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             circuit_breaker=circuit_breaker,
             selected_snapshots=select_models,
             auto_restatement_enabled=environment.lower() == c.PROD,
+            run_environment_statements=True,
         )
 
         if completion_status.is_nothing_to_do:
@@ -2138,6 +2168,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             excluded_requirements=self._excluded_requirements,
             ensure_finalized_snapshots=ensure_finalized_snapshots,
             diff_rendered=diff_rendered,
+            environment_statements=self._environment_statements,
         )
 
     def _run_janitor(self, ignore_ttl: bool = False) -> None:

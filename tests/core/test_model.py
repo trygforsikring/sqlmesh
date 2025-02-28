@@ -13,7 +13,10 @@ from sqlglot import exp, parse_one
 from sqlglot.errors import ParseError
 from sqlglot.schema import MappingSchema
 from sqlmesh.cli.example_project import init_example_project, ProjectTemplate
+from sqlmesh.core.model.kind import TimeColumn, ModelKindName
 
+from sqlmesh import CustomMaterialization, CustomKind
+from pydantic import model_validator
 from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.core.console import get_console
@@ -897,6 +900,8 @@ def test_seed_csv_settings():
               csv_settings (
                 quotechar = '''',
                 escapechar = '\\',
+                keep_default_na = false,
+                na_values = (id = [1, '2', false, null], alias = ('foo'))
               ),
             ),
             columns (
@@ -910,7 +915,39 @@ def test_seed_csv_settings():
     model = load_sql_based_model(expressions, path=Path("./examples/sushi/models/test_model.sql"))
 
     assert isinstance(model.kind, SeedKind)
-    assert model.kind.csv_settings == CsvSettings(quotechar="'", escapechar="\\")
+    assert model.kind.csv_settings == CsvSettings(
+        quotechar="'",
+        escapechar="\\",
+        na_values={"id": [1, "2", False, None], "alias": ["foo"]},
+        keep_default_na=False,
+    )
+    assert model.kind.data_hash_values == [
+        "SEED",
+        "'",
+        "\\",
+        "{'id': [1, '2', False, None], 'alias': ['foo']}",
+        "False",
+    ]
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name db.seed,
+            kind SEED (
+              path '../seeds/waiter_names.csv',
+              csv_settings (
+                na_values = ('#N/A', 'other')
+              ),
+            ),
+        );
+    """
+    )
+
+    model = load_sql_based_model(expressions, path=Path("./examples/sushi/models/test_model.sql"))
+
+    assert isinstance(model.kind, SeedKind)
+    assert model.kind.csv_settings == CsvSettings(na_values=["#N/A", "other"])
+    assert model.kind.data_hash_values == ["SEED", "['#N/A', 'other']"]
 
 
 def test_seed_marker_substitution():
@@ -2119,23 +2156,6 @@ def test_python_model_decorator_kind() -> None:
             path=Path("."),
         )
 
-    @model("kind_view", kind="view", columns={'"COL"': "int"})
-    def kind_view(context):
-        pass
-
-    # error if kind = view
-    with pytest.raises(
-        SQLMeshError, match=r".*Cannot create Python model.*doesnt support Python models"
-    ):
-        python_model = (
-            model.get_registry()["kind_view"]
-            .model(
-                module_path=Path("."),
-                path=Path("."),
-            )
-            .validate_definition()
-        )
-
     @model("kind_dict_badname", kind=dict(name="test"), columns={'"COL"': "int"})
     def my_model_1(context):
         pass
@@ -2207,6 +2227,29 @@ def test_python_model_decorator_col_descriptions() -> None:
             module_path=Path("."),
             path=Path("."),
         )
+
+
+def test_python_model_unsupported_kind() -> None:
+    kinds = {
+        "seed": {"name": ModelKindName.SEED, "path": "."},
+        "view": {"name": ModelKindName.VIEW},
+        "managed": {"name": ModelKindName.MANAGED},
+        "embedded": {"name": ModelKindName.EMBEDDED},
+    }
+
+    for kindname in kinds:
+
+        @model(f"kind_{kindname}", kind=kinds[kindname], columns={'"COL"': "int"})
+        def the_kind(context):
+            pass
+
+        with pytest.raises(
+            SQLMeshError, match=r".*Cannot create Python model.*doesn't support Python models"
+        ):
+            model.get_registry()[f"kind_{kindname}"].model(
+                module_path=Path("."),
+                path=Path("."),
+            ).validate_definition()
 
 
 def test_star_expansion(assert_exp_eq) -> None:
@@ -4028,6 +4071,9 @@ def test_model_dialect_name():
     )
     assert "name `project-1`.`db`.`tbl1`" in model.render_definition()[0].sql(dialect="bigquery")
 
+    # This used to fail due to the dialect regex picking up `DIALECT_TEST` as the model's dialect
+    expressions = d.parse("MODEL(name DIALECT_TEST.foo); SELECT 1")
+
 
 def test_model_allow_partials():
     expressions = d.parse(
@@ -4310,6 +4356,55 @@ def test_when_matched_multiple():
     assert len(whens.expressions) == 2
     assert whens.expressions[0].sql() == expected_when_matched[0]
     assert whens.expressions[1].sql() == expected_when_matched[1]
+
+
+def test_when_matched_merge_filter_multi_part_columns():
+    expressions = d.parse(
+        """
+        MODEL (
+          name @{schema}.records_model,
+          kind INCREMENTAL_BY_UNIQUE_KEY (
+            unique_key name,
+            when_matched (WHEN MATCHED AND source.record.nested_record.field = 1  THEN UPDATE SET target.repeated_record.sub_repeated_record.sub_field = COALESCE(source.repeated_record.sub_repeated_record.sub_field, target.repeated_record.sub_repeated_record.sub_field),
+            WHEN MATCHED THEN UPDATE SET target.repeated_record.sub_repeated_record.sub_field = COALESCE(source.repeated_record.sub_repeated_record.sub_field, target.repeated_record.sub_repeated_record.sub_field)),
+            merge_filter source.record.nested_record.field < target.record.nested_record.field AND
+            target.repeated_record.sub_repeated_record.sub_field > source.repeated_record.sub_repeated_record.sub_field
+          )
+        );
+        SELECT
+            id,
+            [STRUCT([STRUCT(sub_field AS sub_field)] AS sub_repeated_record)] AS repeated_record,
+            STRUCT(
+                STRUCT([2, 3] AS array, field AS field) AS nested_record
+            ) AS record
+        FROM
+            @{schema}.seed_model;
+    """
+    )
+
+    expected_when_matched = [
+        "WHEN MATCHED AND __MERGE_SOURCE__.record.nested_record.field = 1 THEN UPDATE SET __MERGE_TARGET__.repeated_record.sub_repeated_record.sub_field = COALESCE(__MERGE_SOURCE__.repeated_record.sub_repeated_record.sub_field, __MERGE_TARGET__.repeated_record.sub_repeated_record.sub_field)",
+        "WHEN MATCHED THEN UPDATE SET __MERGE_TARGET__.repeated_record.sub_repeated_record.sub_field = COALESCE(__MERGE_SOURCE__.repeated_record.sub_repeated_record.sub_field, __MERGE_TARGET__.repeated_record.sub_repeated_record.sub_field)",
+    ]
+
+    expected_merge_filter = (
+        "__MERGE_SOURCE__.record.nested_record.field < __MERGE_TARGET__.record.nested_record.field AND "
+        "__MERGE_TARGET__.repeated_record.sub_repeated_record.sub_field > __MERGE_SOURCE__.repeated_record.sub_repeated_record.sub_field"
+    )
+
+    model = load_sql_based_model(expressions, dialect="bigquery", variables={"schema": "db"})
+    whens = model.kind.when_matched
+    assert len(whens.expressions) == 2
+    assert whens.expressions[0].sql() == expected_when_matched[0]
+    assert whens.expressions[1].sql() == expected_when_matched[1]
+    assert model.merge_filter.sql() == expected_merge_filter
+
+    model = SqlModel.parse_raw(model.json())
+    whens = model.kind.when_matched
+    assert len(whens.expressions) == 2
+    assert whens.expressions[0].sql() == expected_when_matched[0]
+    assert whens.expressions[1].sql() == expected_when_matched[1]
+    assert model.merge_filter.sql() == expected_merge_filter
 
 
 def test_default_catalog_sql(assert_exp_eq):
@@ -6052,8 +6147,6 @@ def my_model(context, **kwargs):
 
 
 def test_custom_kind():
-    from sqlmesh import CustomMaterialization
-
     expressions = d.parse(
         """
         MODEL (
@@ -6081,7 +6174,8 @@ def test_custom_kind():
     with pytest.raises(
         ConfigError, match=r"Materialization strategy with name 'MyTestStrategy' was not found.*"
     ):
-        load_sql_based_model(expressions)
+        model = load_sql_based_model(expressions)
+        model.validate_definition()
 
     class MyTestStrategy(CustomMaterialization):
         pass
@@ -6115,6 +6209,70 @@ batch_concurrency 2,
 lookback 3
 )"""
     )
+
+
+def test_time_column_format_in_custom_kind():
+    class TimeColumnCustomKind(CustomKind):  # type: ignore[no-untyped-def]
+        _time_column: TimeColumn
+
+        @model_validator(mode="after")
+        def _validate(self):
+            self._time_column = TimeColumn.create(
+                self.materialization_properties.get("time_column"), self.dialect
+            )
+
+        @property
+        def time_column(self):
+            return self._time_column
+
+    class TimeColumnMaterialization(CustomMaterialization[TimeColumnCustomKind]):
+        NAME = "time_column_custom_strategy"
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name db.table,
+            kind CUSTOM (
+                materialization 'time_column_custom_strategy',
+                materialization_properties (
+                  time_column = ts
+                ),
+            ),
+            dialect duckdb
+        );
+
+        SELECT a, b, '2020-01-01' as ts
+        """
+    )
+
+    model = load_sql_based_model(expressions, time_column_format="%d-%m-%Y")
+    assert isinstance(model.kind, TimeColumnCustomKind)
+    assert model.kind.time_column.column == exp.to_column("ts", quoted=True)
+    assert model.kind.time_column.format == "%d-%m-%Y"
+    assert model.kind.dialect == "duckdb"
+    assert "dialect" not in json.loads(
+        model.kind.json()
+    )  # dialect should not be serialized against the kind
+
+    # explicit time_column format within the model
+    expressions = d.parse(
+        """
+        MODEL (
+            name db.table,
+            kind CUSTOM (
+                materialization 'time_column_custom_strategy',
+                materialization_properties (
+                  time_column = (ts, '%Y-%m-%d')
+                ),
+            )
+        );
+
+        SELECT a, b, '2020-01-01' as ts
+        """
+    )
+
+    model = load_sql_based_model(expressions, time_column_format="%d-%m-%Y")
+    assert model.time_column.format == "%Y-%m-%d"
 
 
 def test_model_kind_to_expression():
@@ -6704,7 +6862,7 @@ def test_managed_kind_python():
 
     with pytest.raises(
         SQLMeshError,
-        match=r".*Cannot create Python model.*the 'MANAGED' kind doesnt support Python models",
+        match=r".*Cannot create Python model.*the 'MANAGED' kind doesn't support Python models",
     ):
         model.get_registry()["test_managed_python_model"].model(
             module_path=Path("."),
@@ -7755,3 +7913,33 @@ def test_dynamic_date_spine_model(assert_exp_eq):
         FROM "discount_promotion_dates" AS "discount_promotion_dates"
         """,
     )
+
+
+def test_seed_dont_coerce_na_into_null(tmp_path):
+    model_csv_path = (tmp_path / "model.csv").absolute()
+
+    with open(model_csv_path, "w", encoding="utf-8") as fd:
+        fd.write("code\nNA")
+
+    expressions = d.parse(
+        f"""
+        MODEL (
+            name db.seed,
+            kind SEED (
+              path '{str(model_csv_path)}',
+              csv_settings (
+                -- override NaN handling, such that no value can be coerced into NaN
+                keep_default_na = false,
+                na_values = (),
+              ),
+            ),
+        );
+    """
+    )
+
+    model = load_sql_based_model(expressions, path=Path("./examples/sushi/models/test_model.sql"))
+
+    assert isinstance(model.kind, SeedKind)
+    assert model.seed is not None
+    assert len(model.seed.content) > 0
+    assert next(model.render(context=None)).to_dict() == {"code": {0: "NA"}}

@@ -41,6 +41,7 @@ FORBIDDEN_STATE_SYNC_ENGINES = {
     # Nullable types are problematic
     "clickhouse",
 }
+MOTHERDUCK_TOKEN_REGEX = re.compile(r"(\?motherduck_token=)(\S*)")
 
 
 class ConnectionConfig(abc.ABC, BaseConfig):
@@ -302,11 +303,17 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
         for data_file in data_files:
             key = data_file if isinstance(data_file, str) else data_file.path
             if adapter := BaseDuckDBConnectionConfig._data_file_to_adapter.get(key):
-                logger.info(f"Using existing DuckDB adapter due to overlapping data file: {key}")
+                logger.info(
+                    f"Using existing DuckDB adapter due to overlapping data file: {self._mask_motherduck_token(key)}"
+                )
                 return adapter
 
         if data_files:
-            logger.info(f"Creating new DuckDB adapter for data files: {data_files}")
+            masked_files = {
+                self._mask_motherduck_token(file if isinstance(file, str) else file.path)
+                for file in data_files
+            }
+            logger.info(f"Creating new DuckDB adapter for data files: {masked_files}")
         else:
             logger.info("Creating new DuckDB adapter for in-memory database")
         adapter = super().create_engine_adapter(register_comments_override)
@@ -322,6 +329,9 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
         if self.catalogs:
             return list(self.catalogs)[0]
         return None
+
+    def _mask_motherduck_token(self, string: str) -> str:
+        return MOTHERDUCK_TOKEN_REGEX.sub(lambda m: f"{m.group(1)}{'*' * len(m.group(2))}", string)
 
 
 class MotherDuckConnectionConfig(BaseDuckDBConnectionConfig):
@@ -1094,6 +1104,7 @@ class RedshiftConnectionConfig(ConnectionConfig):
         serverless_acct_id: The account ID of the serverless. Default value None
         serverless_work_group: The name of work group for serverless end point. Default value None.
         pre_ping: Whether or not to pre-ping the connection before starting a new transaction to ensure it is still alive.
+        enable_merge: Whether to use the Redshift merge operation instead of the SQLMesh logical merge.
     """
 
     user: t.Optional[str] = None
@@ -1117,6 +1128,7 @@ class RedshiftConnectionConfig(ConnectionConfig):
     is_serverless: t.Optional[bool] = None
     serverless_acct_id: t.Optional[str] = None
     serverless_work_group: t.Optional[str] = None
+    enable_merge: t.Optional[bool] = None
 
     concurrent_tasks: int = 4
     register_comments: bool = True
@@ -1159,6 +1171,10 @@ class RedshiftConnectionConfig(ConnectionConfig):
         from redshift_connector import connect
 
         return connect
+
+    @property
+    def _extra_engine_config(self) -> t.Dict[str, t.Any]:
+        return {"enable_merge": self.enable_merge}
 
 
 class PostgresConnectionConfig(ConnectionConfig):
@@ -1793,6 +1809,52 @@ class RisingwaveConnectionConfig(ConnectionConfig):
         from psycopg2 import connect
 
         return connect
+
+class RisingwaveConnectionConfig(ConnectionConfig):
+    host: str
+    user: str
+    password: t.Optional[str] = None
+    port: int
+    database: str
+    role: t.Optional[str] = None
+    sslmode: t.Optional[str] = None
+
+    concurrent_tasks: int = 4
+    register_comments: bool = True
+    pre_ping: bool = True
+
+    type_: t.Literal["risingwave"] = Field(alias="type", default="risingwave")
+
+    @property
+    def _connection_kwargs_keys(self) -> t.Set[str]:
+        return {
+            "host",
+            "user",
+            "password",
+            "port",
+            "database",
+            "role",
+            "sslmode",
+        }
+
+    @property
+    def _engine_adapter(self) -> t.Type[EngineAdapter]:
+        return engine_adapter.RisingwaveEngineAdapter
+
+    @property
+    def _connection_factory(self) -> t.Callable:
+        from psycopg2 import connect
+
+        return connect
+
+    @property
+    def _cursor_init(self) -> t.Optional[t.Callable[[t.Any], None]]:
+        def init(cursor: t.Any) -> None:
+            sql = "SET RW_IMPLICIT_FLUSH TO true;"
+            cursor.execute(sql)
+
+        return init
+
 
 CONNECTION_CONFIG_TO_TYPE = {
     # Map all subclasses of ConnectionConfig to the value of their `type_` field.
