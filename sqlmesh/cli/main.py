@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 SKIP_LOAD_COMMANDS = (
+    "orc_sink",
     "clean",
     "create_external_models",
     "destroy",
