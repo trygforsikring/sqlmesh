@@ -2176,7 +2176,7 @@ def test_temp_table_includes_schema_for_ignore_changes(
     model = SqlModel(
         name="test_schema.test_model",
         kind=IncrementalByTimeRangeKind(
-            time_column="a", on_destructive_change=OnDestructiveChange.IGNORE
+            time_column="ds", on_destructive_change=OnDestructiveChange.IGNORE
         ),
         query=parse_one("SELECT c, a FROM tbl WHERE ds BETWEEN @start_ds and @end_ds"),
     )
@@ -2193,6 +2193,7 @@ def test_temp_table_includes_schema_for_ignore_changes(
         return {
             "c": exp.DataType.build("int"),
             "a": exp.DataType.build("int"),
+            "ds": exp.DataType.build("timestamp"),
         }
 
     adapter.columns = columns  # type: ignore
@@ -3727,7 +3728,7 @@ def test_custom_materialization_strategy_with_custom_properties(adapter_mock, ma
     custom_insert_kind = None
 
     class TestCustomKind(CustomKind):
-        _primary_key: t.List[exp.Expression]  # type: ignore[no-untyped-def]
+        _primary_key: t.List[exp.Expr]  # type: ignore[no-untyped-def]
 
         @model_validator(mode="after")
         def _validate_model(self) -> Self:
@@ -3739,7 +3740,7 @@ def test_custom_materialization_strategy_with_custom_properties(adapter_mock, ma
             return self
 
         @property
-        def primary_key(self) -> t.List[exp.Expression]:
+        def primary_key(self) -> t.List[exp.Expr]:
             return self._primary_key
 
     class TestCustomMaterializationStrategy(CustomMaterialization[TestCustomKind]):
@@ -4366,13 +4367,14 @@ def test_multiple_engine_promotion(mocker: MockerFixture, adapter_mock, make_sna
     def columns(table_name):
         return {
             "a": exp.DataType.build("int"),
+            "ds": exp.DataType.build("timestamp"),
         }
 
     adapter.columns = columns  # type: ignore
 
     model = SqlModel(
         name="test_schema.test_model",
-        kind=IncrementalByTimeRangeKind(time_column="a"),
+        kind=IncrementalByTimeRangeKind(time_column="ds"),
         gateway="secondary",
         query=parse_one("SELECT a FROM tbl WHERE ds BETWEEN @start_ds and @end_ds"),
     )
@@ -4395,10 +4397,10 @@ def test_multiple_engine_promotion(mocker: MockerFixture, adapter_mock, make_sna
     cursor_mock.execute.assert_has_calls(
         [
             call(
-                f'DELETE FROM "sqlmesh__test_schema"."test_schema__test_model__{snapshot.version}" WHERE "a" BETWEEN 2020-01-01 00:00:00+00:00 AND 2020-01-02 23:59:59.999999+00:00'
+                f'DELETE FROM "sqlmesh__test_schema"."test_schema__test_model__{snapshot.version}" WHERE "ds" BETWEEN CAST(\'2020-01-01 00:00:00\' AS TIMESTAMP) AND CAST(\'2020-01-02 23:59:59.999999\' AS TIMESTAMP)'
             ),
             call(
-                f'INSERT INTO "sqlmesh__test_schema"."test_schema__test_model__{snapshot.version}" ("a") SELECT "a" FROM (SELECT "a" AS "a" FROM "tbl" AS "tbl" WHERE "ds" BETWEEN \'2020-01-01\' AND \'2020-01-02\') AS "_subquery" WHERE "a" BETWEEN 2020-01-01 00:00:00+00:00 AND 2020-01-02 23:59:59.999999+00:00'
+                f'INSERT INTO "sqlmesh__test_schema"."test_schema__test_model__{snapshot.version}" ("a", "ds") SELECT "a", "ds" FROM (SELECT "a" AS "a" FROM "tbl" AS "tbl" WHERE "ds" BETWEEN \'2020-01-01\' AND \'2020-01-02\') AS "_subquery" WHERE "ds" BETWEEN CAST(\'2020-01-01 00:00:00\' AS TIMESTAMP) AND CAST(\'2020-01-02 23:59:59.999999\' AS TIMESTAMP)'
             ),
         ]
     )

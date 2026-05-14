@@ -234,7 +234,7 @@ class BaseContext(abc.ABC):
         )
 
     def fetchdf(
-        self, query: t.Union[exp.Expression, str], quote_identifiers: bool = False
+        self, query: t.Union[exp.Expr, str], quote_identifiers: bool = False
     ) -> pd.DataFrame:
         """Fetches a dataframe given a sql string or sqlglot expression.
 
@@ -248,7 +248,7 @@ class BaseContext(abc.ABC):
         return self.engine_adapter.fetchdf(query, quote_identifiers=quote_identifiers)
 
     def fetch_pyspark_df(
-        self, query: t.Union[exp.Expression, str], quote_identifiers: bool = False
+        self, query: t.Union[exp.Expr, str], quote_identifiers: bool = False
     ) -> PySparkDataFrame:
         """Fetches a PySpark dataframe given a sql string or sqlglot expression.
 
@@ -692,8 +692,11 @@ class GenericContext(BaseContext, t.Generic[C]):
                     if snapshot.node.project in self._projects:
                         uncached.add(snapshot.name)
                     else:
-                        store = self._standalone_audits if snapshot.is_audit else self._models
-                        store[snapshot.name] = snapshot.node  # type: ignore
+                        local_store = self._standalone_audits if snapshot.is_audit else self._models
+                        if snapshot.name in local_store:
+                            uncached.add(snapshot.name)
+                        else:
+                            local_store[snapshot.name] = snapshot.node  # type: ignore
 
         for model in self._models.values():
             self.dag.add(model.fqn, model.depends_on)
@@ -1102,7 +1105,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         execution_time: t.Optional[TimeLike] = None,
         expand: t.Union[bool, t.Iterable[str]] = False,
         **kwargs: t.Any,
-    ) -> exp.Expression:
+    ) -> exp.Expr:
         """Renders a model's query, expanding macros with provided kwargs, and optionally expanding referenced models.
 
         Args:
@@ -1556,6 +1559,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         run = run or False
         diff_rendered = diff_rendered or False
         skip_linter = skip_linter or False
+        min_intervals = min_intervals or 0
 
         environment = environment or self.config.default_target_environment
         environment = Environment.sanitize_name(environment)
@@ -1856,10 +1860,10 @@ class GenericContext(BaseContext, t.Generic[C]):
         self,
         source: str,
         target: str,
-        on: t.Optional[t.List[str] | exp.Condition] = None,
+        on: t.Optional[t.List[str] | exp.Expr] = None,
         skip_columns: t.Optional[t.List[str]] = None,
         select_models: t.Optional[t.Collection[str]] = None,
-        where: t.Optional[str | exp.Condition] = None,
+        where: t.Optional[str | exp.Expr] = None,
         limit: int = 20,
         show: bool = True,
         show_sample: bool = True,
@@ -1918,7 +1922,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                 raise SQLMeshError(e)
 
             models_to_diff: t.List[
-                t.Tuple[Model, EngineAdapter, str, str, t.Optional[t.List[str] | exp.Condition]]
+                t.Tuple[Model, EngineAdapter, str, str, t.Optional[t.List[str] | exp.Expr]]
             ] = []
             models_without_grain: t.List[Model] = []
             source_snapshots_to_name = {
@@ -2037,9 +2041,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         target_alias: str,
         limit: int,
         decimals: int,
-        on: t.Optional[t.List[str] | exp.Condition] = None,
+        on: t.Optional[t.List[str] | exp.Expr] = None,
         skip_columns: t.Optional[t.List[str]] = None,
-        where: t.Optional[str | exp.Condition] = None,
+        where: t.Optional[str | exp.Expr] = None,
         show: bool = True,
         temp_schema: t.Optional[str] = None,
         skip_grain_check: bool = False,
@@ -2079,10 +2083,10 @@ class GenericContext(BaseContext, t.Generic[C]):
         limit: int,
         decimals: int,
         adapter: EngineAdapter,
-        on: t.Optional[t.List[str] | exp.Condition] = None,
+        on: t.Optional[t.List[str] | exp.Expr] = None,
         model: t.Optional[Model] = None,
         skip_columns: t.Optional[t.List[str]] = None,
-        where: t.Optional[str | exp.Condition] = None,
+        where: t.Optional[str | exp.Expr] = None,
         schema_diff_ignore_case: bool = False,
     ) -> TableDiff:
         if not on:
@@ -2340,7 +2344,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         return not errors
 
     @python_api_analytics
-    def rewrite(self, sql: str, dialect: str = "") -> exp.Expression:
+    def rewrite(self, sql: str, dialect: str = "") -> exp.Expr:
         """Rewrite a sql expression with semantic references into an executable query.
 
         https://sqlmesh.readthedocs.io/en/latest/concepts/metrics/overview/
@@ -3042,10 +3046,17 @@ class GenericContext(BaseContext, t.Generic[C]):
         modified_model_names: t.Set[str],
         execution_time: t.Optional[TimeLike] = None,
     ) -> t.Tuple[t.Optional[int], t.Optional[int]]:
-        if not max_interval_end_per_model:
+        # exclude seeds so their stale interval ends does not become the default plan end date
+        # when they're the only ones that contain intervals in this plan
+        non_seed_interval_ends = {
+            model_fqn: end
+            for model_fqn, end in max_interval_end_per_model.items()
+            if model_fqn not in snapshots or not snapshots[model_fqn].is_seed
+        }
+        if not non_seed_interval_ends:
             return None, None
 
-        default_end = to_timestamp(max(max_interval_end_per_model.values()))
+        default_end = to_timestamp(max(non_seed_interval_ends.values()))
         default_start: t.Optional[int] = None
         # Infer the default start by finding the smallest interval start that corresponds to the default end.
         for model_name in backfill_models or modified_model_names or max_interval_end_per_model:
